@@ -1,4 +1,4 @@
-name: Build iOS v2.29 Satori (Russian dictionary)
+name: Build iOS v2.30 Satori (Russian dictionary)
 
 # Builds the upstream v0.3.5 release code (base) with the Russian dictionary and our own changes.
 # The app version is set in ONE place: APP_VERSION below.
@@ -44,7 +44,7 @@ on:
         default: macos-26
 
 env:
-  APP_VERSION: "2.29"
+  APP_VERSION: "2.30"
   RELEASE_COMMIT: 0f9ea39181d1dc66ce715665f5ef08b494e261a1
 
 jobs:
@@ -2400,6 +2400,15 @@ jobs:
       - name: "Satori v2.29: Jimaku downloads only from jimaku.cc, ASS first, Japanese styles only"
         run: |
           python3 "$GITHUB_WORKSPACE/ours/ci/patches/v229-jimaku-safe.py"
+
+      - name: "Satori v2.30: libtorrent and the bridge (watching online)"
+        run: |
+          brew install ninja cmake || true
+          "$GITHUB_WORKSPACE/ours/ci/torrent/package.sh" "$GITHUB_WORKSPACE/src/safari/satori-torrent"
+
+      - name: "Satori v2.30: watching online without downloading"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v230-stream.py"
 
       - name: Pre-generate files that Xcode expects to already exist
         working-directory: src
