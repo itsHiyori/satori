@@ -1,0 +1,19 @@
+name: libtorrent for iOS (smoke build)
+
+# Builds only the static libtorrent for iOS; pushes to ci-lt-* branches run it, so the library can be fixed without a full app build.
+on:
+  push:
+    branches: ["ci-lt-*"]
+    paths: ["ci/torrent/**", ".github/workflows/libtorrent-ios.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ninja cmake || true
+      - run: ci/torrent/build-libtorrent.sh "$RUNNER_TEMP/lt-out"
+      - run: |
+          lipo -info "$RUNNER_TEMP/lt-out/lib/libtorrent-rasterbar.a"
+          du -sh "$RUNNER_TEMP/lt-out/lib" "$RUNNER_TEMP/lt-out/boost"
