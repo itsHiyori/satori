@@ -32,7 +32,16 @@ s = once(s, '''        .refreshable {
 ''', '''        .refreshable {
             library.reload()
         }
-        .background(NavigationLink(destination: OnlineWatchView(), isActive: $showOnline) { EmptyView() })
+        .sheet(isPresented: $showOnline) {
+            NavigationView {
+                OnlineWatchView()
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarLeading) {
+                            Button("Закрыть") { showOnline = false }
+                        }
+                    }
+            }
+        }
 ''', "online destination")
 s = s.rstrip("\n") + "\n" + (here / "v230-stream.swift").read_text(encoding="utf-8")
 hv.write_text(s, encoding="utf-8")
