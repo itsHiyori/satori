@@ -26,13 +26,9 @@ s = once(s, '''                            Label("Привязать папку 
                             Label("Смотреть онлайн", systemImage: "play.circle")
                         }
 ''', "online menu item")
-s = once(s, '''        .refreshable {
-            library.reload()
-        }
-''', '''        .refreshable {
-            library.reload()
-        }
-        .sheet(isPresented: $showOnline) {
+# next to the YouTube sheet, which opens from the same menu (a sheet on the inner list never showed)
+s = once(s, '''        .sheet(isPresented: $showYouTube) {
+''', '''        .sheet(isPresented: $showOnline) {
             NavigationView {
                 OnlineWatchView()
                     .toolbar {
@@ -42,7 +38,8 @@ s = once(s, '''        .refreshable {
                     }
             }
         }
-''', "online destination")
+        .sheet(isPresented: $showYouTube) {
+''', "online sheet")
 s = s.rstrip("\n") + "\n" + (here / "v230-stream.swift").read_text(encoding="utf-8")
 hv.write_text(s, encoding="utf-8")
 
