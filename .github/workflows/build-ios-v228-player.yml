@@ -1,0 +1,2613 @@
+name: Build iOS v2.29 Satori (Russian dictionary)
+
+# Builds the upstream v0.3.5 release code (base) with the Russian dictionary and our own changes.
+# The app version is set in ONE place: APP_VERSION below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      english:
+        description: 'Control build: keep the ORIGINAL English dictionary'
+        type: boolean
+        default: false
+      entitlements:
+        description: 'Embed the App Group entitlement (settings/statistics sync). Turn off if installing fails.'
+        type: boolean
+        default: true
+      full_entitlements:
+        description: 'Embed all 5 App Groups of the profile and a shared keychain group (not only group .1). Turn off if installing fails.'
+        type: boolean
+        default: true
+      dict_release:
+        description: 'Language dictionary: release tag with the dictionary files (zip)'
+        type: string
+        default: dict
+      dict_glob:
+        description: 'Language dictionary: name of the zip file (pattern, e.g. jp-ru-*.zip)'
+        type: string
+        default: 'jp-ru-*.zip'
+      dict_converter:
+        description: 'Language dictionary: converter script from custom-dict/ (zip -> JMdict xml)'
+        type: string
+        default: kolobok_to_jmdict.py
+      display_120hz:
+        description: 'Let the display link run above 60 Hz on ProMotion (CADisableMinimumFrameDurationOnPhone). Turn off to compare with 60 Hz.'
+        type: boolean
+        default: true
+      runner:
+        description: 'Runner: macos-26; macos-15-intel when GitHub has no Apple Silicon runners free (Xcode 26 is there too)'
+        type: choice
+        options:
+          - macos-26
+          - macos-15-intel
+          - macos-15
+        default: macos-26
+
+env:
+  APP_VERSION: "2.29"
+  RELEASE_COMMIT: 0f9ea39181d1dc66ce715665f5ef08b494e261a1
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout our files (dictionary converter)
+        uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: Checkout upstream release code (base v0.3.5)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          path: src
+
+      - name: Select Xcode (latest stable)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install the iOS platform (needed for device builds on Xcode 26)
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i "iOS" || true
+          # the device SDK is part of Xcode; the download (simulator runtime) may fail on the runner
+          xcodebuild -downloadPlatform iOS || echo "::warning::iOS platform download failed, building with the installed SDK"
+          xcodebuild -showsdks | grep -i "iOS" || true
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: src/package.json
+          run_install: false
+
+      - name: Install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Make Node 20 the default node (Xcode scripts use a fixed PATH)
+        run: |
+          sudo ln -sf "$(command -v node)" /usr/local/bin/node
+          sudo ln -sf "$(command -v npm)" /usr/local/bin/npm
+          sudo ln -sf "$(command -v npx)" /usr/local/bin/npx
+          /usr/local/bin/node --version
+
+      - name: Install cargo
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Install wasm-pack
+        run: npm install -g wasm-pack
+
+      - name: Install pnpm deps
+        working-directory: src
+        run: pnpm install --frozen-lockfile
+
+      - name: Add Anki import libraries (zip, zstd, SQLite)
+        run: |
+          set -euo pipefail
+          # installed outside the pnpm workspace (the workspace packages are not built yet) and copied next to the app code
+          mkdir -p /tmp/ankilibs
+          cd /tmp/ankilibs
+          npm init -y > /dev/null
+          npm install fflate fzstd sql.js --no-audit --no-fund
+          mkdir -p "$GITHUB_WORKSPACE/src/main/node_modules"
+          for pkg in fflate fzstd sql.js; do
+            rm -rf "$GITHUB_WORKSPACE/src/main/node_modules/$pkg"
+            cp -R "/tmp/ankilibs/node_modules/$pkg" "$GITHUB_WORKSPACE/src/main/node_modules/$pkg"
+          done
+          ls "$GITHUB_WORKSPACE/src/main/node_modules/sql.js/dist" | head -20
+
+      - name: Download Russian dictionary from release "dict"
+        if: ${{ !inputs.english }}
+        env:
+          DICT_RELEASE: ${{ inputs.dict_release }}
+        run: |
+          mkdir -p ours/custom-dict
+          gh release download "$DICT_RELEASE" --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --pattern 'jlpt_*.csv' --dir ours/custom-dict --clobber
+          ls -la ours/custom-dict
+
+      - name: Download original JMdict files (JMnedict is still needed)
+        working-directory: src
+        run: pnpm run --dir ./crates/yomikiri-dictionary-generator download
+
+      - name: Replace JMdict with Russian dictionary
+        if: ${{ !inputs.english }}
+        env:
+          DICT_GLOB: ${{ inputs.dict_glob }}
+          DICT_CONVERTER: ${{ inputs.dict_converter }}
+        run: |
+          set -euo pipefail
+          ORIG=src/crates/yomikiri-dictionary-generator/jmdict/jmdict_english.xml
+          ls -la "$ORIG"
+          ZIP=$(ls ours/custom-dict/$DICT_GLOB | head -n1)
+          python3 "ours/custom-dict/$DICT_CONVERTER" "$ZIP" /tmp/jmdict_ru.xml --orig "$ORIG"
+          mv /tmp/jmdict_ru.xml "$ORIG"
+          ls -la "$ORIG"
+
+      - name: Patch Rust (example sentences in dictionary entries)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          def edit(path, fn):
+              p = pathlib.Path("src") / path
+              p.write_text(fn(p.read_text(encoding="utf-8")), encoding="utf-8")
+
+          # --- jmdict crate: <example>japanese U+E002 translation</example>
+          def types_rs(s):
+              return replace_once(s, "    // 'example'\n    // example: Vec<Example>,\n}\n", """    /// 'example' (custom format: japanese, U+E002, translation)
+              pub examples: Vec<JMExample>,
+          }
+
+          #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+          pub struct JMExample {
+              pub japanese: String,
+              pub translation: String,
+          }
+          """, "types.rs example field")
+          edit("crates/jmdict/src/jmdict/types.rs", types_rs)
+
+          def parse_rs(s):
+              s = replace_once(s, "use super::types::{\n    JMDialect, JMDict, JMEntry, JMKanji, JMKanjiInfo, JMPartOfSpeech, JMReading, JMSense,\n    JMSenseMisc,\n};",
+                  "use super::types::{\n    JMDialect, JMDict, JMEntry, JMExample, JMKanji, JMKanjiInfo, JMPartOfSpeech, JMReading,\n    JMSense, JMSenseMisc,\n};", "parse.rs import")
+              s = replace_once(s, """                b"example" => {
+                              parse_string_in_tag_into(&mut self.reader, &mut self.buf, b"example")?;
+                          }""", """                b"example" => {
+                              let text =
+                                  parse_string_in_tag_into(&mut self.reader, &mut self.buf, b"example")?;
+                              if let Some((japanese, translation)) = text.split_once('\\u{e002}') {
+                                  sense.examples.push(JMExample {
+                                      japanese: japanese.to_string(),
+                                      translation: translation.to_string(),
+                                  });
+                              }
+                          }""", "parse.rs example arm")
+              return s
+          edit("crates/jmdict/src/jmdict/parse.rs", parse_rs)
+
+          # --- yomikiri-dictionary crate: Sense.examples
+          def entry_rs(s):
+              return replace_once(s, "    pub dialects: Vec<JMDialect>,\n}\n", """    pub dialects: Vec<JMDialect>,
+              /// Example sentences (Japanese with marked keyword, translation)
+              pub examples: Vec<SenseExample>,
+          }
+
+          #[cfg_attr(feature = "wasm", derive(Tsify))]
+          #[cfg_attr(feature = "wasm", tsify(into_wasm_abi))]
+          #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+          #[serde(rename_all = "camelCase")]
+          pub struct SenseExample {
+              /// The keyword is wrapped in U+E000 ... U+E001
+              pub japanese: String,
+              pub translation: String,
+          }
+          """, "entry.rs Sense")
+          edit("crates/yomikiri-dictionary/src/entry.rs", entry_rs)
+
+          def jmdict_rs(s):
+              s = replace_once(s, "    GroupedSense, Kanji, PartOfSpeech, Rarity, Reading, Sense, WordEntry, WordEntryInner,\n};",
+                  "    GroupedSense, Kanji, PartOfSpeech, Rarity, Reading, Sense, SenseExample, WordEntry,\n    WordEntryInner,\n};", "jmdict.rs import")
+              return replace_once(s, "            meanings: jm_sense\n", """            examples: jm_sense
+                          .examples
+                          .into_iter()
+                          .map(|e| SenseExample {
+                              japanese: e.japanese,
+                              translation: e.translation,
+                          })
+                          .collect(),
+                      meanings: jm_sense
+          """, "jmdict.rs From")
+          edit("crates/yomikiri-dictionary/src/jmdict.rs", jmdict_rs)
+
+          edit("crates/yomikiri-dictionary/src/jmnedict.rs", lambda s: replace_once(s,
+              "                    dialects: vec![],\n                })",
+              "                    dialects: vec![],\n                    examples: vec![],\n                })", "jmnedict.rs"))
+          edit("crates/yomikiri-dictionary/src/lib.rs", lambda s: replace_once(s,
+              "pub use entry::{Kanji, PartOfSpeech, Reading, Sense, WordEntry};",
+              "pub use entry::{Kanji, PartOfSpeech, Reading, Sense, SenseExample, WordEntry};", "lib.rs"))
+          PY
+
+      - name: Add example sentences to the Russian dictionary (XML)
+        if: ${{ !inputs.english }}
+        env:
+          DICT_GLOB: ${{ inputs.dict_glob }}
+        run: |
+          set -euo pipefail
+          ORIG=src/crates/yomikiri-dictionary-generator/jmdict/jmdict_english.xml
+          ZIP=$(ls ours/custom-dict/$DICT_GLOB | head -n1)
+          cat > /tmp/add_examples.py <<'PY'
+          import glob, json, sys, zipfile, re, unicodedata
+
+          KS, KE, SEP = "\ue000", "\ue001", "\ue002"
+
+          def flat(node, mark=False):
+              """Plain text of structured content; skips <rt>; marks example-keyword."""
+              if node is None:
+                  return ""
+              if isinstance(node, str):
+                  return node
+              if isinstance(node, list):
+                  return "".join(flat(n, mark) for n in node)
+              if isinstance(node, dict):
+                  tag = node.get("tag")
+                  if tag == "rt" or tag == "rp":
+                      return ""
+                  inner = flat(node.get("content"), mark)
+                  data = node.get("data") or {}
+                  if mark and data.get("content") == "example-keyword" and inner:
+                      return KS + inner + KE
+                  return inner
+              return ""
+
+          def walk(node, fn):
+              if isinstance(node, list):
+                  for n in node:
+                      walk(n, fn)
+              elif isinstance(node, dict):
+                  fn(node)
+                  walk(node.get("content"), fn)
+
+          def find(node, name, out):
+              def f(n):
+                  d = n.get("data")
+                  if d and d.get("content") == name:
+                      out.append(n)
+              walk(node, f)
+              return out
+
+          def norm(s):
+              return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", s)).strip()
+
+          def extract(zip_path):
+              """-> {seq: [variant, ...]}, variant = [ {"glosses": [..], "examples": [(ja_marked, ru)]}, ... ] (all senses of one Yomitan entry)"""
+              result = {}
+              with zipfile.ZipFile(zip_path) as z:
+                  names = sorted(n for n in z.namelist() if re.match(r"term_bank_\d+\.json$", n.split("/")[-1]))
+                  for name in names:
+                      for e in json.loads(z.read(name)):
+                          seq = e[6]
+                          variant = []
+                          for g in e[5]:
+                              if not isinstance(g, dict) or g.get("type") != "structured-content":
+                                  continue
+                              for sense in find(g["content"], "sense", []):
+                                  glosses = []
+                                  for gl in find(sense, "glossary", []):
+                                      c = gl.get("content")
+                                      for li in (c if isinstance(c, list) else [c]):
+                                          t = norm(flat(li))
+                                          if t:
+                                              glosses.append(t)
+                                  exs = []
+                                  for ex in find(sense, "example-sentence", []):
+                                      a = find(ex, "example-sentence-a", [])
+                                      b = find(ex, "example-sentence-b", [])
+                                      if a and b:
+                                          ja = flat(a[0], True).strip()
+                                          ru = re.sub(r"\s*\[\d+\]\s*$", "", norm(flat(b[0])))
+                                          if ja and ru and (ja, ru) not in exs:
+                                              exs.append((ja, ru))
+                                  variant.append({"glosses": glosses, "examples": exs})
+                          if any(s["examples"] for s in variant):
+                              lst = result.setdefault(seq, [])
+                              if variant not in lst:
+                                  lst.append(variant)
+              return result
+
+
+          import html, re, sys, unicodedata
+
+          MAX_PER_SENSE = 2
+          ENTRY_RE = re.compile(r"<entry>.*?</entry>", re.S)
+          SEQ_RE = re.compile(r"<ent_seq>\s*(\d+)\s*</ent_seq>")
+          SENSE_RE = re.compile(r"<sense>.*?</sense>", re.S)
+          GLOSS_RE = re.compile(r"<gloss[^>]*>(.*?)</gloss>", re.S)
+
+          def tokens(glosses):
+              return set(re.findall(r"\w+", " ".join(glosses).lower()))
+
+          def clean(t):
+              return t.replace("&", "\uff06").replace("<", "\u2039").replace(">", "\u203a")
+
+          def inject(xml_in, xml_out, zip_path):
+              data = extract(zip_path)
+              st = dict(entries=0, senses=0, matched_index=0, matched_gloss=0, examples=0)
+              with open(xml_in, encoding="utf-8") as f:
+                  text = f.read()
+
+              def fix_entry(m):
+                  block = m.group(0)
+                  sm = SEQ_RE.search(block)
+                  if not sm:
+                      return block
+                  variants = data.get(int(sm.group(1)))
+                  if not variants:
+                      return block
+                  senses = SENSE_RE.findall(block)
+                  if not senses:
+                      return block
+                  xml_g = [[norm(html.unescape(g)) for g in GLOSS_RE.findall(s)] for s in senses]
+                  chosen = [None] * len(senses)
+                  # 1) variant with the same number of senses, best gloss overlap, matched by index
+                  same = [v for v in variants if len(v) == len(senses)]
+                  if same:
+                      def score(v):
+                          total = 0.0
+                          for xg, ys in zip(xml_g, v):
+                              a, b = tokens(xg), tokens(ys["glosses"])
+                              if a and b:
+                                  total += len(a & b) / len(a | b)
+                          return total
+                      best = max(same, key=score)
+                      chosen = [ys["examples"] for ys in best]
+                      st["matched_index"] += len(senses)
+                  else:
+                      # 2) per sense: identical gloss list in some variant
+                      for i, xg in enumerate(xml_g):
+                          for v in variants:
+                              for ys in v:
+                                  if ys["glosses"] == xg and ys["examples"]:
+                                      chosen[i] = ys["examples"]
+                                      break
+                              if chosen[i]:
+                                  break
+                          if chosen[i]:
+                              st["matched_gloss"] += 1
+                  st["entries"] += 1
+                  st["senses"] += len(senses)
+                  out, pos, idx = [], 0, 0
+                  for sm2 in SENSE_RE.finditer(block):
+                      s = sm2.group(0)
+                      exs = chosen[idx] or []
+                      idx += 1
+                      if exs:
+                          add = "".join(
+                              "<example>%s%s%s</example>" % (clean(ja), SEP, clean(ru))
+                              for ja, ru in exs[:MAX_PER_SENSE]
+                          )
+                          st["examples"] += min(len(exs), MAX_PER_SENSE)
+                          s = s[: -len("</sense>")] + add + "</sense>"
+                      out.append(block[pos : sm2.start()])
+                      out.append(s)
+                      pos = sm2.end()
+                  out.append(block[pos:])
+                  return "".join(out)
+
+              text = ENTRY_RE.sub(fix_entry, text)
+              with open(xml_out, "w", encoding="utf-8") as f:
+                  f.write(text)
+              print("examples injected:", st)
+              if st["examples"] == 0:
+                  raise SystemExit("ERROR: no examples were matched to dictionary entries")
+
+
+          if __name__ == "__main__":
+              inject(sys.argv[1], sys.argv[2], sys.argv[3])
+          PY
+          python3 /tmp/add_examples.py "$ORIG" /tmp/jmdict_ru_examples.xml "$ZIP"
+          mv /tmp/jmdict_ru_examples.xml "$ORIG"
+          ls -la "$ORIG"
+
+      - name: Generate yomikiri dictionary
+        working-directory: src
+        run: pnpm run --dir ./crates/yomikiri-dictionary-generator generate
+
+      - name: Patch Svelte (example sentences in the word card)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/main/src/components/dictionary/GroupedSenseView.svelte")
+          s = p.read_text(encoding="utf-8")
+
+          s = replace_once(s, '  $: posText = group.pos.join(", ");\n', '''  $: posText = group.pos.join(", ");
+
+            /** Splits an example sentence into plain parts and the keyword (U+E000 ... U+E001). */
+            function exampleParts(text: string): { text: string; key: boolean }[] {
+              const parts: { text: string; key: boolean }[] = [];
+              const re = /\\ue000(.*?)\\ue001/g;
+              let last = 0;
+              let m: RegExpExecArray | null;
+              while ((m = re.exec(text)) !== null) {
+                if (m.index > last) parts.push({ text: text.slice(last, m.index), key: false });
+                parts.push({ text: m[1], key: true });
+                last = m.index + m[0].length;
+              }
+              if (last < text.length) parts.push({ text: text.slice(last), key: false });
+              return parts;
+            }
+          ''', "svelte script")
+
+          s = replace_once(s, '''          >{/if}
+                </div>
+              {/each}''', '''          >{/if}
+                  {#if sense.examples && sense.examples.length > 0}
+                    <div class="examples">
+                      {#each sense.examples as example}
+                        <div class="example">
+                          <div class="example-ja">
+                            {#each exampleParts(example.japanese) as part}{#if part.key}<b>{part.text}</b>{:else}{part.text}{/if}{/each}
+                          </div>
+                          <div class="example-tr">{example.translation}</div>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/each}''', "svelte template")
+
+          s = replace_once(s, "</style>", '''
+            .examples {
+              margin: 0.2rem 0 0.4rem 1.1rem;
+              padding-left: 0.6rem;
+              border-left: 2px solid var(--text-faint);
+            }
+
+            .example {
+              margin-bottom: 0.25rem;
+            }
+
+            .example-ja {
+              font-size: 0.9rem;
+              line-height: 1.35;
+              color: var(--text-light);
+            }
+
+            .example-ja b {
+              font-weight: 600;
+              color: var(--text);
+            }
+
+            .example-tr {
+              font-size: 0.8rem;
+              line-height: 1.3;
+              color: var(--text-faint);
+            }
+          </style>''', "svelte style")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch Swift (App Group sync, statistics tab, share sheet)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_swift_app_group_stats_share.py"
+
+      - name: Patch TypeScript (add "audio" field type)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          d = pathlib.Path("src/main/src/lib/anki")
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          # template.ts: new field type "audio"
+          p = d / "template.ts"
+          s = p.read_text()
+          s = replace_once(s, '  link: FieldBase<"link">;\n}', '  link: FieldBase<"link">;\n  audio: FieldBase<"audio">;\n}', "types")
+          s = replace_once(s, '  "url",\n  "link",\n];', '  "url",\n  "link",\n  "audio",\n];', "type list")
+          s = replace_once(s, '  link: "link",\n};', '  link: "link",\n  audio: "audio",\n};', "labels")
+          s = replace_once(s, '    content === "link"\n  ) {', '    content === "link" ||\n    content === "audio"\n  ) {', "new field")
+          p.write_text(s)
+
+          # ankiBuilder.ts: builder for "audio"
+          p = d / "ankiBuilder.ts"
+          s = p.read_text()
+          s += """
+          /**
+           * Audio from JapanesePod101.
+           *
+           * AnkiMobile downloads a field's content by itself if the whole field is a link
+           * to an audio file, and replaces it with a [sound:...] tag.
+           * The link must end with a known file extension, so a fake argument is appended.
+           */
+          const JPOD101_URL = "https://assets.languagepod101.com/dictionary/japanese/audiomp3.php";
+          /** Size of the 'audio not available' clip that JapanesePod101 returns. */
+          const JPOD101_PLACEHOLDER_SIZE = 52288;
+
+          async function findJpod101Audio(word: string, reading: string): Promise<string> {
+            const query = `?kanji=${encodeURIComponent(word)}&kana=${encodeURIComponent(reading)}`;
+            try {
+              const resp = await fetch(JPOD101_URL + query);
+              if (!resp.ok) return "";
+              const buf = await resp.arrayBuffer();
+              if (buf.byteLength === JPOD101_PLACEHOLDER_SIZE || buf.byteLength < 2000) {
+                return "";
+              }
+            } catch (err) {
+              // Could not verify (network or cross-origin restrictions).
+              // Still give the link to AnkiMobile.
+              console.warn("Could not check JapanesePod101 audio:", err);
+            }
+            return JPOD101_URL + query + "&fakePath=audio.mp3";
+          }
+
+          addBuilder("audio", (_opts, data) => {
+            const token = data.tokenized.tokens[data.tokenized.tokenIdx];
+            const word = token.base;
+            const reading = getReadingForForm(data.entry, word, false).reading || word;
+            return Utils.PromiseWithProgress.fromPromise(
+              findJpod101Audio(word, reading),
+              "Finding audio...",
+            );
+          });
+          """
+          p.write_text(s)
+          # config.ts: bake the Anki template into the defaults.
+          # Sideloaded builds have no shared storage, so the extension cannot see
+          # settings saved in the app. Stored settings still override these defaults.
+          import json
+          DEFAULT_TEMPLATE = {
+              "deck": "mining",
+              "notetype": "kaishi mining",
+              "tags": "yomikiri-ru",
+              "fields": [
+                  {"name": "Word", "content": "word", "form": "as-is", "style": "basic"},
+                  {"name": "Reading", "content": ""},
+                  {"name": "Meaning", "content": "meaning", "full_format": "numbered", "full_pos": False, "full_max_item": 0, "single_pos": False, "single_max_item": 0},
+                  {"name": "Sentence", "content": "sentence", "style": "basic", "word": "none"},
+                  {"name": "SentenceMeaning", "content": "translated-sentence"},
+                  {"name": "Audio", "content": "audio"},
+                  {"name": "SectenceAudio", "content": ""},
+                  {"name": "Image", "content": ""},
+                  {"name": "Furigana", "content": "word", "form": "main-dict-form", "style": "furigana-anki"},
+              ],
+          }
+          override = pathlib.Path("ours/custom-dict/anki_template.json")
+          template = json.loads(override.read_text()) if override.exists() else DEFAULT_TEMPLATE
+          p = pathlib.Path("src/main/src/lib/config.ts")
+          s = p.read_text()
+          old = '  "anki.anki_template": null,\n  "anki.enabled": false,'
+          assert s.count(old) == 1, "default anki options not found in config.ts"
+          tpl_ts = json.dumps(template, indent=2, ensure_ascii=False).replace("\n", "\n  ")
+          s = s.replace(old, '  "anki.anki_template": ' + tpl_ts + ',\n  "anki.enabled": true,')
+          s = replace_once(s, '  "general.font_size": 14,', '  "general.font_size": 11,', "default font size")
+          p.write_text(s)
+
+          # translate.ts: translate sentences into Russian instead of English
+          p = pathlib.Path("src/main/src/platform/common/translate.ts")
+          s = p.read_text()
+          s = replace_once(s, 'const targetLang = "en";', 'const targetLang = "ru";', "translate target language")
+          p.write_text(s)
+
+          print("audio patch OK")
+          PY
+
+      - name: Patch CSS (dark theme by default)
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+
+          p = pathlib.Path("src/main/src/global.css")
+          s = p.read_text()
+
+          dark = {
+              "text": "#e8e8e8",
+              "text-light": "#a0a0a5",
+              "text-faint": "#6e6e73",
+              "text-success": "#5fd068",
+              "text-warn": "#ff6b6b",
+              "border": "#3a3a3c",
+              "background": "#1c1c1e",
+              "background-alt-light": "#242426",
+              "background-alt": "#2c2c2e",
+              "background-dark": "#48484a",
+              "input": "#2c2c2e",
+              "selected-blue": "#0a84ff",
+              "button-light": "#8e8e93",
+              "button-bg": "#3a3a3c",
+          }
+          for name, value in dark.items():
+              pattern = re.compile(r"^(  --" + re.escape(name) + r": )[^;]+;", re.M)
+              assert len(pattern.findall(s)) == 1, "css variable not found once: " + name
+              s = pattern.sub(lambda m: m.group(1) + value + ";", s)
+
+          old = "  --edge-horizontal-padding: 8px;"
+          assert s.count(old) == 1, "edge padding var not found"
+          s = s.replace(old, old + "\n  color-scheme: dark;")
+          p.write_text(s)
+          print("dark theme OK")
+          PY
+
+      - name: Patch Svelte (Russian settings UI, dark cards, no dictionary update, build version)
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+
+          root = pathlib.Path("src/main/src/components/options")
+          build = os.environ["BUILD_NUMBER"]
+
+          def patch(rel, pairs):
+              p = root / rel
+              s = p.read_text()
+              for old, new in pairs:
+                  assert s.count(old) == 1, rel + ": not found exactly once: " + old
+                  s = s.replace(old, new)
+              p.write_text(s)
+
+          # dark cards
+          patch("GroupedOptions.svelte", [("background-color: white;", "background-color: var(--background);")])
+
+          # no dictionary section (and no way to replace the Russian dictionary)
+          (root / "groups/GroupDictionary.svelte").write_text('<script lang="ts">\n</script>\n')
+
+          patch("groups/GroupAbout.svelte", [
+              ('title="About"', 'title="О программе"'),
+              ('title="About Yomikiri"', 'title="О Yomikiri"'),
+              ('return "v" + versionInfo.version;', 'return "' + os.environ["APP_VERSION"] + ' release (' + build + ')";'),
+              ("Loading version.", "Загрузка версии."),
+              ('title="Third party licenses"', 'title="Лицензии третьих сторон"'),
+              ('buttonText={"View"}', 'buttonText={"Открыть"}'),
+              ("View licenses for third party open source libraries & resources", "Лицензии сторонних библиотек и ресурсов с открытым кодом"),
+              ('title="View source code"', 'title="Исходный код"'),
+              ("https://github.com/bluegreenmagick/yomikiri", "https://github.com/itsHiyori/yomikiri"),
+              ("Yomikiri is an open source project! You can view the code on GitHub.", "Yomikiri — проект с открытым исходным кодом. Код можно посмотреть на GitHub."),
+          ])
+
+          patch("groups/GroupAnki.svelte", [
+              ('title="Use Anki"', 'title="Использовать Anki"'),
+              ("Connecting to Anki...", "Подключение к Anki..."),
+              ("Successfully connected to Anki.", "Успешно подключено к Anki."),
+              ("</a> app is not installed.", "</a> не установлен."),
+              ("</a> is a flashcard app.", "</a> — приложение для карточек."),
+              ('title="Configure Anki template"', 'title="Настроить шаблон Anki"'),
+              ('buttonText="Configure"', 'buttonText="Настроить"'),
+              ('title="Reopen Safari after adding Anki note"', 'title="Возвращаться в Safari после добавления заметки"'),
+              ("If disabled, you can manually return to Safari by clicking", "Если выключено, вернуться в Safari можно вручную, нажав"),
+              ("on top left corner of the screen", "в левом верхнем углу экрана"),
+          ])
+
+          patch("groups/GroupAppearance.svelte", [
+              ('title="Appearance"', 'title="Внешний вид"'),
+              ('title="Font size"', 'title="Размер шрифта"'),
+              ("Text size (px)", "Размер текста (px)"),
+              ('title="Japanese Font"', 'title="Японский шрифт"'),
+              ("For Japanese text only", "Только для японского текста"),
+              ('title="Tooltip max height"', 'title="Максимальная высота подсказки"'),
+              ("Maximum height of dictionary tooltip (px)", "Максимальная высота окна словаря (px)"),
+          ])
+          print("svelte patch OK")
+          PY
+
+      - name: Patch frequency dictionaries (Jiten) into the lookup tooltip
+        run: |
+          python3 - <<'PY'
+          import base64, glob, json, pathlib, re, struct, zipfile
+
+          # ---------- 1. build binary tables from Yomitan frequency dictionaries ----------
+          def fnv(s):
+              h = 0x811C9DC5
+              b = s.encode("utf-16-le")
+              for i in range(0, len(b), 2):
+                  h ^= b[i] | (b[i + 1] << 8)
+                  h = (h * 0x01000193) & 0xFFFFFFFF
+              return h
+
+          dicts = []
+          for path in sorted(glob.glob("ours/custom-dict/*freq*.zip")):
+              z = zipfile.ZipFile(path)
+              title = json.loads(z.read("index.json"))["title"]
+              dict_id = pathlib.Path(path).stem
+              best = {}
+              for name in sorted(n for n in z.namelist() if n.startswith("term_meta_bank_")):
+                  for term, kind, data in json.loads(z.read(name)):
+                      if kind != "freq":
+                          continue
+                      if "reading" in data:
+                          key = fnv(term + "|" + data["reading"])
+                          freq = data["frequency"]
+                      else:
+                          key = fnv(term)
+                          freq = data
+                      rank = freq["value"] if isinstance(freq, dict) else int(freq)
+                      kana = isinstance(freq, dict) and str(freq.get("displayValue", "")).endswith("\u32d5")
+                      slot = best.setdefault(key, [0, 0])
+                      i = 1 if kana else 0
+                      if slot[i] == 0 or rank < slot[i]:
+                          slot[i] = rank
+              flat = []
+              for key in sorted(best):
+                  flat += [key, best[key][0], best[key][1]]
+              blob = struct.pack("<%dI" % len(flat), *flat)
+              dicts.append({"id": dict_id, "name": title, "data": base64.b64encode(blob).decode("ascii")})
+              print("frequency dictionary:", title, len(best), "keys")
+
+          bg = pathlib.Path("src/main/src/extension/background")
+          data_ts = "export const FREQ_DICTS: { id: string; name: string; data: string }[] = " + json.dumps(dicts) + ";\n"
+          (bg / "frequencyData.ts").write_text(data_ts)
+
+          # the list of dictionaries for the settings page (names only, no data)
+          dict_list = [
+              {"id": d["id"], "name": d["name"], "label": re.sub(r"\s*\(WebNovel\)", "(WN)", d["name"], flags=re.I)}
+              for d in dicts
+          ]
+          (pathlib.Path("src/main/src/lib") / "freqDictList.ts").write_text(
+              "export const FREQ_DICT_LIST: { id: string; name: string; label: string }[] = "
+              + json.dumps(dict_list, ensure_ascii=False)
+              + ";\n"
+          )
+
+          # ---------- 2. background: lookup by binary search ----------
+          (bg / "frequency.ts").write_text('''import { handleMessage } from "extension/browserApi";
+          import { FREQ_DICTS } from "./frequencyData";
+
+          interface FreqTable {
+            name: string;
+            data: Uint32Array;
+          }
+
+          let tables: FreqTable[] | undefined;
+
+          function decode(b64: string): Uint32Array {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return new Uint32Array(bytes.buffer);
+          }
+
+          function hash(s: string): number {
+            let h = 0x811c9dc5;
+            for (let i = 0; i < s.length; i++) {
+              h ^= s.charCodeAt(i);
+              h = Math.imul(h, 0x01000193);
+            }
+            return h >>> 0;
+          }
+
+          /** Returns index of the record (3 numbers: key, rank, kana rank) */
+          function find(t: Uint32Array, key: number): number | undefined {
+            let lo = 0;
+            let hi = t.length / 3 - 1;
+            while (lo <= hi) {
+              const mid = (lo + hi) >>> 1;
+              const k = t[mid * 3];
+              if (k === key) return mid * 3;
+              if (k < key) lo = mid + 1;
+              else hi = mid - 1;
+            }
+            return undefined;
+          }
+
+          export interface FrequencyRequest {
+            term: string;
+            reading: string;
+          }
+
+          export interface FrequencyResult {
+            name: string;
+            /** e.g. ["1065\u32d5", "59854"] */
+            values: string[];
+          }
+
+          function lookup(req: FrequencyRequest): FrequencyResult[] {
+            if (tables === undefined) {
+              tables = FREQ_DICTS.map((d) => ({ name: d.name, data: decode(d.data) }));
+            }
+            const results: FrequencyResult[] = [];
+            for (const t of tables) {
+              const i =
+                find(t.data, hash(req.term + "|" + req.reading)) ??
+                find(t.data, hash(req.term));
+              if (i !== undefined) {
+                const items: [number, string][] = [];
+                if (t.data[i + 1] > 0) items.push([t.data[i + 1], String(t.data[i + 1])]);
+                if (t.data[i + 2] > 0) items.push([t.data[i + 2], t.data[i + 2] + "\u32d5"]);
+                items.sort((a, b) => a[0] - b[0]);
+                results.push({ name: t.name, values: items.map((x) => x[1]) });
+              }
+            }
+            return results;
+          }
+
+          handleMessage("frequency", lookup);
+          ''')
+
+          # ---------- 3. register in background entry + message map ----------
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = bg / "index.ts"
+          s = p.read_text()
+          s = replace_once(s, 'import { AnkiApi, type DesktopAnkiApi } from "@platform/anki";',
+                           'import { AnkiApi, type DesktopAnkiApi } from "@platform/anki";\nimport "./frequency";', "bg import")
+          p.write_text(s)
+
+          # ---------- 4. badges in the dictionary entry ----------
+          p = pathlib.Path("src/main/src/components/dictionary/Badges.svelte")
+          s = p.read_text()
+          s = replace_once(s, 'import { type Entry, isCommonEntry } from "lib/dicEntry";',
+                           'import {\n    type Entry,\n    isCommonEntry,\n    getMainForm,\n    getReadingForForm,\n  } from "lib/dicEntry";', "badges import")
+          s = replace_once(s, '  let hasBadges: boolean;\n',
+          '''  let hasBadges: boolean;
+            let freqs: { name: string; values: string[] }[] = [];
+            let requestId = 0;
+
+            function loadFrequencies(entry: Entry): void {
+              freqs = [];
+              if (entry.type !== "word") return;
+              // eslint-disable-next-line
+              const rt = (globalThis as any).chrome?.runtime;
+              if (rt === undefined || typeof rt.sendMessage !== "function") return;
+              const term = getMainForm(entry);
+              const reading = getReadingForForm(entry, term, false).reading;
+              const id = ++requestId;
+              const send = (retry: boolean) => {
+                // eslint-disable-next-line
+                rt.sendMessage({ key: "frequency", request: { term, reading } }, (resp: any) => {
+                  void rt.lastError;
+                  if (id !== requestId) return;
+                  if (resp === undefined && retry) {
+                    setTimeout(() => send(false), 1000);
+                  } else if (resp?.success === true && Array.isArray(resp.resp)) {
+                    freqs = resp.resp;
+                  }
+                });
+              };
+              send(true);
+            }
+          ''', "badges vars")
+          s = replace_once(s, '  $: hasBadges = isCommon || isName;', '  $: hasBadges = isCommon || isName || freqs.length > 0;\n  $: loadFrequencies(entry);', "badges reactive")
+          s = replace_once(s, '    {#if isName}\n      <div class="badge name">name</div>\n    {/if}\n',
+                           '    {#if isName}\n      <div class="badge name">name</div>\n    {/if}\n    {#each freqs as f}\n      <div class="badge freq">{f.name}: {f.values.join(", ")}</div>\n    {/each}\n', "badges markup")
+          s = replace_once(s, '  .name {\n    --badge-color: #d3a7d7;\n  }\n', '  .name {\n    --badge-color: #d3a7d7;\n  }\n\n  .freq {\n    --badge-color: #8fb4d9;\n  }\n', "badges css")
+          p.write_text(s)
+
+          # ---------- 5. message map ----------
+          p = pathlib.Path("src/main/src/extension/browserApi.ts")
+          s = p.read_text()
+          s = replace_once(s, '  getDictMetadata: [void, DictionaryMetadata];\n',
+                           '  getDictMetadata: [void, DictionaryMetadata];\n  frequency: [\n    { term: string; reading: string },\n    { name: string; values: string[] }[],\n  ];\n', "message map")
+          p.write_text(s)
+          print("frequency patch OK")
+          PY
+
+      - name: Patch toolbar (zoom buttons A- / A+ in the lookup window)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          p = pathlib.Path("src/main/src/components/dictionary/Toolbar.svelte")
+          s = p.read_text()
+
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, "toolbar: not found exactly once: " + old
+              s = s.replace(old, new)
+
+          rep('  import IconClose from "@icons/close.svg";\n',
+              '  import IconClose from "@icons/close.svg";\n  import { Config } from "lib/config";\n')
+          rep('  export let changeSelectedTool: (tool: Tools) => void;\n',
+          '''  export let changeSelectedTool: (tool: Tools) => void;
+
+            /** Change UI scale. Saved to config, so it is remembered. */
+            async function changeSize(delta: number): Promise<void> {
+              const config = await Config.instance.get();
+              const size = config.get("general.font_size");
+              await config.set("general.font_size", Math.min(24, Math.max(8, size + delta)));
+            }
+          ''')
+          rep('''    {#if tooltipMode}
+                <button
+                  class="tool-button"
+                  title="Close"''', '''    {#if tooltipMode}
+                <button
+                  class="tool-button text-button"
+                  title="Уменьшить масштаб"
+                  on:click={() => void changeSize(-1)}
+                >
+                  A−
+                </button>
+                <button
+                  class="tool-button text-button"
+                  title="Увеличить масштаб"
+                  on:click={() => void changeSize(1)}
+                >
+                  A+
+                </button>
+                <button
+                  class="tool-button"
+                  title="Закрыть"''')
+          rep('title="Translate sentence"', 'title="Перевести предложение"')
+          rep('title="Grammar"', 'title="Грамматика"')
+          rep('  .icon {\n    fill: #000000;', '  .text-button {\n    color: #000000;\n    font-weight: bold;\n    white-space: nowrap;\n  }\n\n  .icon {\n    fill: #000000;')
+          p.write_text(s)
+          print("toolbar patch OK")
+          PY
+
+      - name: Patch statistics (mined words, kanji, reading counter, popup view)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_statistics.py"
+
+      - name: Patch shared storage (sync fix, keychain channel, on-device diagnostics)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_shared_storage.py"
+
+      - name: Patch app and share sheet (shared mined words, frequencies, marks, look)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_app_share_sheet.py"
+
+      - name: Patch mined words list, frequency highlighting, short badges, translation
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_mined_words_highlight.py"
+
+      - name: Download Kanjium pitch accents (accents.txt)
+        run: |
+          mkdir -p ours/custom-dict
+          curl -fsSL --retry 3 -o ours/custom-dict/kanjium_accents.txt https://raw.githubusercontent.com/mifunetoshiro/kanjium/master/data/source_files/raw/accents.txt || echo "Could not download accents.txt"
+          ls -la ours/custom-dict/
+
+      - name: Download JLPT vocabulary lists
+        run: |
+          mkdir -p ours/custom-dict
+          for n in 5 4 3 2 1; do
+            if [ -s "ours/custom-dict/jlpt_n$n.csv" ]; then
+              echo "Own list for N$n found, not downloading"
+              continue
+            fi
+            curl -fsSL --retry 3 -o "ours/custom-dict/jlpt_n$n.csv" "https://raw.githubusercontent.com/jamsinclair/open-anki-jlpt-decks/main/src/n$n.csv" || echo "Could not download the list for N$n"
+          done
+          ls -la ours/custom-dict/
+
+      - name: Patch pitch accent (compact display next to the word)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_pitch_accent.py"
+
+      - name: Patch audio button, JLPT highlighting, settings notes
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_audio_jlpt_settings.py"
+
+      - name: Patch video player (MKV subtitles + in-app player)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_video_player_mkv.py"
+      - name: Add KSPlayer (SPM), Files access, native player with word lookup
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/add_ksplayer_native_player.py"
+
+      - name: Patch video player (remember last subtitles, keep chosen file, highlight diagnostics)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          # 1. remember the last choice for all videos
+          s = replace_once(s, '''    private func chooseNone() {
+                  UserDefaults.standard.set("", forKey: subChoiceKey)
+          ''', '''    private func chooseNone() {
+                  UserDefaults.standard.set("", forKey: subChoiceKey)
+                  UserDefaults.standard.set("none", forKey: "subchoice.last.kind")
+          ''', "chooseNone")
+          s = replace_once(s, '''        UserDefaults.standard.set(track.subtitleID, forKey: subChoiceKey)
+          ''', '''        UserDefaults.standard.set(track.subtitleID, forKey: subChoiceKey)
+                  UserDefaults.standard.set("embedded", forKey: "subchoice.last.kind")
+                  UserDefaults.standard.set(track.languageCode ?? "", forKey: "subchoice.last.lang")
+          ''', "chooseEmbedded")
+          s = replace_once(s, '''        UserDefaults.standard.set("file:" + file.lastPathComponent, forKey: subChoiceKey)
+          ''', '''        UserDefaults.standard.set("file:" + file.lastPathComponent, forKey: subChoiceKey)
+                  UserDefaults.standard.set("external", forKey: "subchoice.last.kind")
+                  let videoBase = url.deletingPathExtension().lastPathComponent
+                  if file.lastPathComponent.hasPrefix(videoBase) {
+                      UserDefaults.standard.set(String(file.lastPathComponent.dropFirst(videoBase.count)), forKey: "subchoice.last.suffix")
+                  }
+          ''', "chooseExternal")
+
+          # 2. loadSubtitles: external choice must survive the player's own default track; last choice for new videos
+          s = replace_once(s, '''        subDelay = UserDefaults.standard.double(forKey: delayKey)
+          ''', '''        subDelay = UserDefaults.standard.double(forKey: delayKey)
+                  syncMessage = HighlightData.diagnostic()
+          ''', "diagnostic")
+
+          s = replace_once(s, '''        var restoredFile = false
+                  if let savedChoice, savedChoice.hasPrefix("file:") {
+                      let file = folder.appendingPathComponent(String(savedChoice.dropFirst(5)))
+                      if FileManager.default.fileExists(atPath: file.path) {
+                          chooseExternal(file)
+                          restoredFile = true
+                      }
+                  }
+          ''', '''        var restoredFile = false
+                  var restoredURL: URL?
+                  if let savedChoice, savedChoice.hasPrefix("file:") {
+                      let file = folder.appendingPathComponent(String(savedChoice.dropFirst(5)))
+                      if FileManager.default.fileExists(atPath: file.path) {
+                          chooseExternal(file)
+                          restoredFile = true
+                          restoredURL = file
+                      }
+                  }
+                  // a video without its own choice: the last choice of any video (same kind of file, language, or none)
+                  let lastKind = UserDefaults.standard.string(forKey: "subchoice.last.kind")
+                  if savedChoice == nil, lastKind == "external",
+                     let suffix = UserDefaults.standard.string(forKey: "subchoice.last.suffix"),
+                     let file = externalURLs.first(where: { $0.lastPathComponent == base + suffix }) {
+                      chooseExternal(file)
+                      restoredFile = true
+                      restoredURL = file
+                  }
+                  let useLast = savedChoice == nil && !restoredFile && (lastKind == "embedded" || lastKind == "none")
+          ''', "restore block")
+
+          s = replace_once(s, '''pickSubtitle: !hasExternal && !restoredFile && embeddedChoice == nil,''',
+                           '''pickSubtitle: !hasExternal && !restoredFile && embeddedChoice == nil && !useLast,''', "pickSubtitle")
+
+          s = replace_once(s, '''        if !restoredFile, let embeddedChoice {
+                      await NativeVideoEngine.restoreSavedSubtitle(coordinator: coordinator, saved: embeddedChoice,
+                                                                   key: subChoiceKey)
+                  }
+          ''', '''        if !restoredFile, let embeddedChoice {
+                      await NativeVideoEngine.restoreSavedSubtitle(coordinator: coordinator, saved: embeddedChoice,
+                                                                   key: subChoiceKey)
+                  }
+                  if useLast {
+                      let lang: String? = lastKind == "none" ? nil : (UserDefaults.standard.string(forKey: "subchoice.last.lang") ?? "")
+                      if lastKind == "none" {
+                          usingExternal = false
+                          activeExternal = nil
+                      }
+                      let applied = await NativeVideoEngine.restoreLastChoice(coordinator: coordinator, lang: lang,
+                                                                              key: subChoiceKey, excluded: skipped)
+                      if !applied, !hasExternal {
+                          await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: true, excluded: skipped)
+                      }
+                  }
+                  if restoredFile, let restored = restoredURL {
+                      // KSPlayer picks its own subtitle track a little after the start and would replace the file:
+                      // keep the chosen file unless the user picks something else
+                      for _ in 0..<8 {
+                          try? await Task.sleep(nanoseconds: 700_000_000)
+                          if UserDefaults.standard.string(forKey: subChoiceKey) != "file:" + restored.lastPathComponent { break }
+                          if coordinator.subtitleModel.selectedSubtitleInfo != nil {
+                              coordinator.subtitleModel.selectedSubtitleInfo = nil
+                              usingExternal = !externalCues.isEmpty
+                              activeExternal = restored
+                          }
+                      }
+                  }
+          ''', "after restore")
+
+          s = replace_once(s, '''    static func autoSelectJapanese(coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool,''',
+          '''    /// The last subtitle choice of any video: a language (nil = subtitles off). Repeated a few times,
+              /// because the player selects its own default track right after the start.
+              @MainActor
+              static func restoreLastChoice(coordinator: KSVideoPlayer.Coordinator, lang: String?, key: String,
+                                            excluded: Set<Int>) async -> Bool {
+                  for _ in 0..<60 {
+                      if !coordinator.subtitleModel.subtitleInfos.isEmpty { break }
+                      try? await Task.sleep(nanoseconds: 250_000_000)
+                  }
+                  var pick: FFmpegAssetTrack?
+                  if let lang {
+                      let tracks = coordinator.subtitleModel.subtitleInfos.compactMap { $0 as? FFmpegAssetTrack }
+                          .filter { !excluded.contains(Int($0.trackID)) && ($0.languageCode ?? "") == lang }
+                      pick = tracks.first(where: { !$0.isImageSubtitle }) ?? tracks.first
+                      if pick == nil { return false }
+                  }
+                  for _ in 0..<5 {
+                      try? await Task.sleep(nanoseconds: 700_000_000)
+                      if UserDefaults.standard.string(forKey: key) != nil { return true }   // the user chose in this video
+                      if let pick {
+                          if coordinator.subtitleModel.selectedSubtitleInfo?.subtitleID != pick.subtitleID {
+                              coordinator.subtitleModel.selectedSubtitleInfo = pick
+                          }
+                      } else if coordinator.subtitleModel.selectedSubtitleInfo != nil {
+                          coordinator.subtitleModel.selectedSubtitleInfo = nil
+                      }
+                  }
+                  return true
+              }
+
+              @MainActor
+              static func autoSelectJapanese(coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool,''', "restoreLastChoice")
+
+          # 3. highlight: one line of diagnostics on the screen
+          s = replace_once(s, '''    static let jlptColors: [Int: String]''', '''    /// What the subtitle highlight sees: shown once when a video opens
+              static func diagnostic() -> String {
+                  let settings = Settings.load()
+                  if !settings.enabled { return "подсветка выключена в настройках" }
+                  let tables = freqTables().count
+                  let jlpt = jlptTable() != nil
+                  return "подсветка: частотных таблиц \\(tables), JLPT \\(jlpt ? "есть" : "нет"), ранги \\(settings.lo)–\\(settings.hi)"
+              }
+
+              static let jlptColors: [Int: String]''', "diagnostic func")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch video player (smoother playback, recovery after background, return from Anki)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          # ---------- 1. player: smoother playback, recovery after the app was in the background, return from Anki ----------
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          # the engine is chosen once per video (the body runs ~10 times per second)
+          s = replace_once(s, '''    static func prepare(for url: URL) {
+                  switch url.pathExtension.lowercased() {''', '''    private static var preparedFor: String?
+
+              static func prepare(for url: URL) {
+                  if preparedFor == url.path { return }
+                  preparedFor = url.path
+                  switch url.pathExtension.lowercased() {''', "prepare once")
+
+          # asynchronous decompression delivers frames unevenly: the default (off) gives an even rhythm
+          s = replace_once(s, '''        KSOptions.asynchronousDecompression = true
+          ''', '''        KSOptions.asynchronousDecompression = false
+          ''', "async off")
+
+          s = replace_once(s, '''    @State private var lastSavedPosition: Double = -1
+          ''', '''    @State private var lastSavedPosition: Double = -1
+              @State private var wentToBackground = false
+          ''', "state")
+
+          s = replace_once(s, '''        .onChange(of: showLookup) { shown in
+                      if !shown {
+                          coordinator.playerLayer?.play()
+                      }
+                  }
+          ''', '''        .onChange(of: showLookup) { shown in
+                      if !shown {
+                          coordinator.playerLayer?.play()
+                      }
+                  }
+                  // back from AnkiMobile (x-success): close the lookup sheet and continue the video
+                  .onReceive(NotificationCenter.default.publisher(for: Notification.Name("yomikiri.ankiReturn"))) { _ in
+                      showLookup = false
+                      coordinator.playerLayer?.play()
+                  }
+                  .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+                      wentToBackground = true
+                  }
+                  .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                      recoverAfterBackground()
+                  }
+          ''', "onReceive")
+
+          s = replace_once(s, '''    private func togglePlay() {''', '''    /// After the app was minimized the picture may stay on one frame while sound and subtitles go on:
+              /// a seek to the same position restarts the video output (the same as seeking by hand).
+              private func recoverAfterBackground() {
+                  guard wentToBackground else { return }
+                  wentToBackground = false
+                  guard resumeHandled, let layer = coordinator.playerLayer, layer.player.isPlaying else { return }
+                  let time = layer.player.currentPlaybackTime
+                  Task { @MainActor in
+                      try? await Task.sleep(nanoseconds: 400_000_000)
+                      guard let current = coordinator.playerLayer, current.player.isPlaying else { return }
+                      current.player.seek(time: time) { _ in }
+                  }
+              }
+
+              private func togglePlay() {''', "recover")
+
+          # the highlight settings and the mined words are read once in a few seconds, not for every subtitle line
+          s = replace_once(s, '''        let settings = Settings.load()
+                  guard settings.enabled else { return [:] }
+                  var result: [Int: Color] = [:]
+                  let mined = minedWords()
+          ''', '''        let (settings, mined) = cachedSettings()
+                  guard settings.enabled else { return [:] }
+                  var result: [Int: Color] = [:]
+          ''', "colors cache use")
+          s = replace_once(s, '''    static func colors(for tokens: [LookupToken]) -> [Int: Color] {''', '''    private static var settingsCache: (time: Date, settings: Settings, mined: Set<String>)?
+
+              private static func cachedSettings() -> (Settings, Set<String>) {
+                  if let c = settingsCache, Date().timeIntervalSince(c.time) < 5 { return (c.settings, c.mined) }
+                  let settings = Settings.load()
+                  let mined: Set<String> = settings.enabled ? minedWords() : []
+                  settingsCache = (Date(), settings, mined)
+                  return (settings, mined)
+              }
+
+              static func colors(for tokens: [LookupToken]) -> [Int: Color] {''', "colors cache")
+          p.write_text(s, encoding="utf-8")
+
+          # ---------- 2. app: AnkiMobile returns with yomikiri://ankiReturn ----------
+          p = pathlib.Path("src/safari/iOS (App)/YomikiriApp.swift")
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, "        if url.isAnkiInfo {\n", '''        if url.host?.lowercased() == "ankireturn" {
+                      NotificationCenter.default.post(name: Notification.Name("yomikiri.ankiReturn"), object: nil)
+                      return
+                  }
+                  if url.isAnkiInfo {
+          ''', "handleOpenUrl")
+          p.write_text(s, encoding="utf-8")
+
+          p = pathlib.Path("src/main/src/platform/iosapp/anki.ts")
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, "    const url = iosAnkiMobileURL(note);\n    await Platform.messageWebview(\"openLink\", url);",
+                           "    const url = iosAnkiMobileURL(note, \"yomikiri://ankiReturn\");\n    await Platform.messageWebview(\"openLink\", url);", "anki x-success")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch video player (no pause after returning from Anki)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          s = replace_once(s, '''    @State private var wentToBackground = false
+          ''', '''    @State private var wentToBackground = false
+              @State private var ankiReturning = false
+          ''', "state")
+
+          s = replace_once(s, '''        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("yomikiri.ankiReturn"))) { _ in
+                      showLookup = false
+                      coordinator.playerLayer?.play()
+                  }
+          ''', '''        // back from AnkiMobile: no seek (a seek caused the pause), just keep playing
+                  .onReceive(NotificationCenter.default.publisher(for: Notification.Name("yomikiri.ankiReturn"))) { _ in
+                      ankiReturning = true
+                      wentToBackground = false
+                      showLookup = false
+                      Task { @MainActor in
+                          for delay in [0.1, 0.4, 1.0] {
+                              try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                              coordinator.playerLayer?.play()
+                          }
+                      }
+                  }
+          ''', "anki return")
+
+          s = replace_once(s, '''        guard wentToBackground else { return }
+                  wentToBackground = false
+          ''', '''        guard wentToBackground else { return }
+                  wentToBackground = false
+                  if ankiReturning { return }
+          ''', "recover skip")
+
+          s = replace_once(s, '''            guard let current = coordinator.playerLayer, current.player.isPlaying else { return }
+                      current.player.seek(time: time) { _ in }
+          ''', '''            guard !ankiReturning, let current = coordinator.playerLayer, current.player.isPlaying else { return }
+                      current.player.seek(time: time) { _ in }
+          ''', "recover guard")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch Info.plist (120 Hz display link for smoother video)
+        if: ${{ inputs.display_120hz }}
+        run: |
+          python3 - <<'PY'
+          import plistlib, pathlib
+          p = pathlib.Path("src/safari/iOS (App)/Info.plist")
+          d = plistlib.loads(p.read_bytes())
+          d["CADisableMinimumFrameDurationOnPhone"] = True   # let the app's display link run above 60 Hz on ProMotion iPhones
+          p.write_bytes(plistlib.dumps(d))
+          print("ok", d["CADisableMinimumFrameDurationOnPhone"])
+          PY
+
+      - name: Patch video player (close lookup sheet after Anki)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, '''            Task { @MainActor in
+                          for delay in [0.1, 0.4, 1.0] {
+                              try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                              coordinator.playerLayer?.play()
+                          }
+                      }
+          ''', '''            // SwiftUI may ignore a dismissal that arrives while the app is still returning from the background,
+                      // so the lookup sheet is closed again a few times, and the video is played again each time
+                      Task { @MainActor in
+                          for delay in [0.1, 0.4, 1.0] {
+                              try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                              showLookup = false
+                              coordinator.playerLayer?.play()
+                          }
+                      }
+          ''', "close sheet repeatedly")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch video player (lookup window lowered in landscape, no dimming)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          # no dimming behind the lookup window (iOS 16.4+)
+          s = replace_once(s, '''                content.presentationBackground(.clear)
+          ''', '''                content.presentationBackground(.clear).presentationBackgroundInteraction(.enabled)
+          ''', "no dimming")
+
+          s = replace_once(s, '''    @State private var wentToBackground = false
+          ''', '''    @State private var wentToBackground = false
+              @Environment(\\.verticalSizeClass) private var verticalSize
+          ''', "size class")
+
+          # portrait / iPad: the system sheet; landscape: the window is lowered (own overlay)
+          s = replace_once(s, '''        .sheet(isPresented: $showLookup) {
+                      WordLookupSheet(text: lookupWord)
+                  }
+          ''', '''        .sheet(isPresented: Binding(get: { showLookup && verticalSize != .compact },
+                                              set: { showLookup = $0 })) {
+                      WordLookupSheet(text: lookupWord)
+                  }
+          ''', "sheet only outside landscape")
+
+          s = replace_once(s, '''            if controlsVisible {
+                          controlsLayer
+                      }
+          ''', '''            if controlsVisible {
+                          controlsLayer
+                      }
+                      if showLookup && verticalSize == .compact {
+                          landscapeLookup
+                      }
+          ''', "landscape overlay")
+
+          s = replace_once(s, '''    private func togglePlay() {''', '''    /// Landscape: the lookup window sits at the bottom (the free gap is on top, as in portrait), nothing is dimmed.
+              /// A tap on the gap or a swipe down on the handle closes it.
+              private var landscapeLookup: some View {
+                  GeometryReader { geo in
+                      VStack(spacing: 0) {
+                          Color.clear
+                              .frame(height: geo.size.height * 0.22)
+                              .contentShape(Rectangle())
+                              .onTapGesture { showLookup = false }
+                          WordLookupSheet(text: lookupWord)
+                              .overlay(alignment: .top) {
+                                  Capsule()
+                                      .fill(Color.secondary.opacity(0.6))
+                                      .frame(width: 36, height: 5)
+                                      .padding(.vertical, 8)
+                                      .padding(.horizontal, 60)
+                                      .contentShape(Rectangle())
+                                      .gesture(DragGesture().onEnded { value in
+                                          if value.translation.height > 40 { showLookup = false }
+                                      })
+                              }
+                      }
+                  }
+              }
+
+              private func togglePlay() {''', "landscapeLookup")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch Anki import (colpkg/apkg collections, known words)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          LIB = r'''import { unzipSync } from "fflate";
+          import { decompress } from "fzstd";
+          import { Platform } from "@platform";
+          // @ts-ignore pure JavaScript build, no wasm file to copy; static import because the iife bundle has no dynamic imports
+          import initSqlJs from "sql.js/dist/sql-asm.js";
+
+          const TAGS = /<[^>]*>/g;
+          const BRACKETS = /\[[^\]]*\]/g;
+          const SPACES = /\s+/g;
+
+          /** The same word rule as for mined notes: Furigana, then Word, then the first field. */
+          function wordFromFields(names: string[], values: string[]): string {
+            let i = names.indexOf("Furigana");
+            if (i < 0) i = names.indexOf("Word");
+            if (i < 0) i = 0;
+            return (values[i] ?? "").replace(TAGS, "").replace(BRACKETS, "").replace(SPACES, "");
+          }
+
+          function collectionBytes(data: Uint8Array): Uint8Array {
+            const files = unzipSync(data);
+            if (files["collection.anki21b"]) return decompress(files["collection.anki21b"]);
+            if (files["collection.anki2"]) return files["collection.anki2"];
+            throw new Error("в архиве нет базы коллекции");
+          }
+
+          function fieldNames(db: any): Record<string, string[]> {
+            const out: Record<string, string[]> = {};
+            try {
+              const rows = db.exec("select ntid, ord, name from fields order by ntid, ord");
+              for (const row of rows[0] ? rows[0].values : []) {
+                const key = String(row[0]);
+                if (!out[key]) out[key] = [];
+                out[key].push(String(row[2]));
+              }
+              if (Object.keys(out).length > 0) return out;
+            } catch (e) {
+              // older collections keep the note types in col.models
+            }
+            const models = JSON.parse(db.exec("select models from col")[0].values[0][0]);
+            for (const key of Object.keys(models)) {
+              out[key] = models[key].flds.map((f: any) => String(f.name));
+            }
+            return out;
+          }
+
+          /** Words of all notes of an Anki collection package (.colpkg or .apkg). */
+          export async function readAnkiWords(buf: ArrayBuffer): Promise<string[]> {
+            const bytes = collectionBytes(new Uint8Array(buf));
+            // @ts-ignore pure JavaScript build, no wasm file to copy
+            const SQL = await initSqlJs();
+            const db = new SQL.Database(bytes);
+            try {
+              const names = fieldNames(db);
+              const words = new Set<string>();
+              const rows = db.exec("select mid, flds from notes");
+              for (const row of rows[0] ? rows[0].values : []) {
+                const values = String(row[1]).split("\x1f");
+                const word = wordFromFields(names[String(row[0])] ?? [], values);
+                if (word) words.add(word);
+              }
+              return Array.from(words);
+            } finally {
+              db.close();
+            }
+          }
+
+          /** Adds the words to the known list (they are not highlighted). Returns how many were new. */
+          export async function importKnownWords(words: string[]): Promise<number> {
+            const raw = (await Platform.messageWebview("loadStats", null)) as any;
+            const data: any = raw && raw.days !== undefined ? raw : { days: {} };
+            const set = new Set<string>(Array.isArray(data.known) ? data.known : []);
+            let added = 0;
+            for (const w of words) {
+              if (!set.has(w)) {
+                set.add(w);
+                added++;
+              }
+            }
+            data.known = Array.from(set);
+            await Platform.messageWebview("saveStats", data);
+            return added;
+          }
+          '''
+
+          SVELTE = r'''<script lang="ts">
+            import { readAnkiWords, importKnownWords } from "lib/ankiImport";
+
+            let status = "";
+            let busy = false;
+
+            async function onFile(e: Event) {
+              const input = e.target as HTMLInputElement;
+              const file = input.files ? input.files[0] : undefined;
+              input.value = "";
+              if (!file) return;
+              busy = true;
+              status = "Чтение колоды...";
+              try {
+                const words = await readAnkiWords(await file.arrayBuffer());
+                const added = await importKnownWords(words);
+                status = `Слов в колоде: ${words.length}, добавлено новых: ${added}. Они больше не подсвечиваются.`;
+              } catch (err) {
+                status = "Не удалось прочитать колоду: " + (err instanceof Error ? err.message : String(err));
+              } finally {
+                busy = false;
+              }
+            }
+          </script>
+
+          <div class="import">
+            <div class="title">Импорт колоды Anki</div>
+            <label class="pick">
+              <input type="file" on:change={onFile} disabled={busy} />
+              Выбрать файл .colpkg или .apkg
+            </label>
+            {#if status}<div class="status">{status}</div>{/if}
+          </div>
+
+          <style>
+            .import {
+              margin: 12px 16px;
+              font-size: 0.95rem;
+            }
+            .title {
+              font-weight: 600;
+              margin-bottom: 6px;
+            }
+            .status {
+              margin-top: 6px;
+              font-size: 0.85rem;
+              color: var(--text-faint);
+            }
+          </style>
+          '''
+
+          base = pathlib.Path("src")
+          (base / "main/src/lib/ankiImport.ts").write_text(LIB, encoding="utf-8")
+          (base / "main/src/components/options/groups/GroupAnkiImport.svelte").write_text(SVELTE, encoding="utf-8")
+
+          p = base / "main/src/components/options/MainColumn.svelte"
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, 'import GroupAnki from "./groups/GroupAnki.svelte";\n',
+              'import GroupAnki from "./groups/GroupAnki.svelte";\n  import GroupAnkiImport from "./groups/GroupAnkiImport.svelte";\n', "import")
+          s = replace_once(s, "  <GroupAnki />\n", "  <GroupAnki />\n  {#if Platform.IS_IOSAPP}\n    <GroupAnkiImport />\n  {/if}\n", "mount")
+          p.write_text(s, encoding="utf-8")
+
+          p = base / "main/src/lib/statsLite.ts"
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, "export interface LiteStats {\n", "export interface LiteStats {\n  known?: string[];\n", "LiteStats")
+          s = replace_once(s, "const mined = Array.from(set);", "(data.known ?? []).forEach((w) => set.add(w));\n  const mined = Array.from(set);", "findMinedLite")
+          p.write_text(s, encoding="utf-8")
+
+          p = base / "safari/iOS (App)/HelpView.swift"
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, "return words", 'for w in (root["known"] as? [String]) ?? [] { words.insert(w) }\n        return words', "minedWords")
+          p.write_text(s, encoding="utf-8")
+
+          p = base / "main/esbuild.config.ts"
+          s = p.read_text(encoding="utf-8")
+          s = replace_once(s, '    format: "iife",\n', '    format: "iife",\n    external: ["fs", "path", "crypto", "node:*"],\n', "esbuild external")
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Patch subtitles and highlight (Jimaku search, kana rank, content words, tail of the line, seek, landscape)
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/patch_subtitles_jimaku.py"
+
+      - name: Fixes after test build (lookup bottom edge, clock rate, return from Anki)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          # 1. lookup window: the dictionary page reaches the bottom edge (no empty strip under it in landscape)
+          s = replace_once(s, "                    .ignoresSafeArea(.keyboard)\n",
+                           "                    .ignoresSafeArea(.keyboard)\n                    .ignoresSafeArea(.container, edges: .bottom)\n", "webview bottom")
+
+          # 2. playback clock: 5 updates per second instead of 10 (less redraw of the player on the main thread)
+          s = replace_once(s, "Timer.publish(every: 0.1, on: .main, in: .common)",
+                           "Timer.publish(every: 0.2, on: .main, in: .common)", "clock rate")
+
+          # 3. after returning from AnkiMobile: restart the video output (seek to the same place, keep playing)
+          s = replace_once(s, "        if ankiReturning { return }\n", "", "recover allowed")
+          s = replace_once(s, "guard !ankiReturning, let current", "guard let current", "recover guard")
+          s = replace_once(s, "            wentToBackground = false\n            showLookup = false",
+                           "            showLookup = false", "keep background flag")
+
+          p.write_text(s, encoding="utf-8")
+          print("v127 fixes applied")
+          PY
+
+      - name: Fixes v1.28 (edge-to-edge lookup page, key icon left, one Jimaku button, output restart after jumps)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          # ---------- YomikiriWebView: optional edge-to-edge (no system inset under the page) ----------
+          w = pathlib.Path("src/safari/Shared (iOS)/YomikiriWebView.swift")
+          t = w.read_text(encoding="utf-8")
+          t = replace_once(t, "    var overscroll = true\n", "    var overscroll = true\n    var edgeToEdge = false\n", "edgeToEdge property")
+          t = replace_once(t, "        webview.scrollView.isScrollEnabled = scrollable\n\n        let request = URLRequest",
+                           "        webview.scrollView.isScrollEnabled = scrollable\n        if edgeToEdge {\n            webview.scrollView.contentInsetAdjustmentBehavior = .never\n        }\n\n        let request = URLRequest", "edgeToEdge apply")
+          t = replace_once(t, "    func overscroll(_ value: Bool) -> YomikiriWebView {",
+                           "    func edgeToEdge(_ value: Bool) -> YomikiriWebView {\n        var view = self\n        view.edgeToEdge = value\n        return view\n    }\n\n    func overscroll(_ value: Bool) -> YomikiriWebView {", "edgeToEdge builder")
+          w.write_text(t, encoding="utf-8")
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          # lookup window: the page is edge-to-edge; the v1.27 modifier on the outside is removed
+          s = replace_once(s, "                    .overscroll(false)\n                    .ignoresSafeArea(.keyboard)\n                    .ignoresSafeArea(.container, edges: .bottom)\n",
+                           "                    .overscroll(false)\n                    .edgeToEdge(true)\n                    .ignoresSafeArea(.keyboard)\n", "lookup page edge")
+
+          # API key icon: to the left of the title bar (next to the import/folder group)
+          s = replace_once(s, "            ToolbarItem(placement: .navigationBarTrailing) {\n                Button {\n                    showKey = true",
+                           "            ToolbarItem(placement: .navigationBarLeading) {\n                Button {\n                    showKey = true", "key left")
+
+          # one Jimaku search button in the player settings: the duplicate is removed
+          s = replace_once(s, '''                    Button("Найти в Jimaku") {
+                                  Task { @MainActor in
+                                      if let file = await JimakuFinder.run(url, report: { syncMessage = $0 }) {
+                                          if !externalURLs.contains(file) { externalURLs.append(file) }
+                                          subDelay = UserDefaults.standard.double(forKey: delayKey)
+                                          chooseExternal(file)
+                                      }
+                                  }
+                              }
+          ''', "", "duplicate jimaku button")
+
+          # after any jump: restart the video output if it was playing (no change of position)
+          s = replace_once(s, "coordinator.playerLayer?.seek(time: time, autoPlay: playing) { _ in }",
+                           "coordinator.playerLayer?.seek(time: time, autoPlay: playing) { _ in restartOutput() }", "seek restart")
+          s = replace_once(s, "    /// Landscape: the lookup window",
+          '''    /// After a jump the picture can stay on one frame while the sound goes on.
+              /// Pause and play again a moment later restarts the video output; the position does not change.
+              private func restartOutput() {
+                  Task { @MainActor in
+                      try? await Task.sleep(nanoseconds: 250_000_000)
+                      guard let layer = coordinator.playerLayer, layer.player.isPlaying else { return }
+                      layer.pause()
+                      try? await Task.sleep(nanoseconds: 60_000_000)
+                      coordinator.playerLayer?.play()
+                  }
+              }
+
+              /// Landscape: the lookup window''', "restartOutput helper")
+
+          # after returning from AnkiMobile: no seek, only the output restart
+          s = replace_once(s, "            current.seek(time: time, autoPlay: true) { _ in }\n",
+                           "            current.pause()\n            try? await Task.sleep(nanoseconds: 60_000_000)\n            current.play()\n", "recover without seek")
+          p.write_text(s, encoding="utf-8")
+          print("v128 fixes applied")
+          PY
+
+      - name: Fixes v1.29 (output restart after returning from Anki)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+
+          # after AnkiMobile: the video is paused when the app becomes active, so the recovery of the output has to start
+          # from the return handler (after the video is playing again), not from didBecomeActive
+          s = replace_once(s, '''                    showLookup = false
+                              coordinator.playerLayer?.play()
+                          }
+          ''', '''                    showLookup = false
+                              coordinator.playerLayer?.play()
+                              if delay == 0.4 { restartOutput() }
+                          }
+          ''', "restart after anki return")
+
+          # unused value
+          s = replace_once(s, '''        guard resumeHandled, let layer = coordinator.playerLayer, layer.player.isPlaying else { return }
+                  let time = layer.player.currentPlaybackTime
+          ''', '''        guard resumeHandled, coordinator.playerLayer?.player.isPlaying == true else { return }
+          ''', "unused time")
+
+          p.write_text(s, encoding="utf-8")
+          print("v129 fixes applied")
+          PY
+
+      - name: Optimizations - shared formatters
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          # ---------- statistics: one NumberFormatter instead of one per row ----------
+          hv = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          t = hv.read_text(encoding="utf-8")
+          old_num = '''private func statNumber(_ n: Int) -> String {
+              let formatter = NumberFormatter()
+              formatter.numberStyle = .decimal
+              formatter.locale = Locale(identifier: "ru_RU")
+              return formatter.string(from: NSNumber(value: n)) ?? String(n)
+          }'''
+          if old_num in t:
+              t = t.replace(old_num, '''private let statNumberFormatter: NumberFormatter = {
+              let formatter = NumberFormatter()
+              formatter.numberStyle = .decimal
+              formatter.locale = Locale(identifier: "ru_RU")
+              return formatter
+          }()
+
+          private func statNumber(_ n: Int) -> String {
+              return statNumberFormatter.string(from: NSNumber(value: n)) ?? String(n)
+          }''')
+              hv.write_text(t, encoding="utf-8")
+              print("statistics: number formatter is shared")
+          else:
+              print("statistics: pattern not in this build, skipped")
+
+          # ---------- extension journal: one ISO formatter instead of one per request ----------
+          ut = pathlib.Path("src/safari/YomikiriTokenizer/YomikiriTokenizer/Utils.swift")
+          u = ut.read_text(encoding="utf-8")
+          old_stamp = "    let stamp = ISO8601DateFormatter().string(from: Date())\n"
+          if old_stamp in u:
+              u = u.replace(old_stamp, "    let stamp = extLogStamp.string(from: Date())\n")
+              u = u.replace("/// Short request log shared by the app and the Safari extension",
+                            "private let extLogStamp = ISO8601DateFormatter()\n\n/// Short request log shared by the app and the Safari extension", 1)
+              ut.write_text(u, encoding="utf-8")
+              print("journal: timestamp formatter is shared")
+          else:
+              print("journal: not in this build, skipped")
+          PY
+
+      - name: Highlight descriptions - shorter
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+
+          # Shorter descriptions of the highlight settings (the text is only replaced where it is found)
+          p = pathlib.Path("src/main/src/components/options/groups/GroupHighlight.svelte")
+          if not p.exists():
+              print("highlight descriptions: file not in this build, skipped")
+          else:
+              t = p.read_text(encoding="utf-8")
+              replacements = [
+                  (r'(<OptionToggle bind:value=\{\$enabledConfig\} title="Подсвечивать слова">\n    )([\s\S]*?)(\n  </OptionToggle>)',
+                   'Выделяет слова, которых ещё нет в Anki. После изменения обновите страницу.'),
+                  (r'(<OptionToggle bind:value=\{\$freqConfig\} title="Подсвечивать по частотности">\n    )([\s\S]*?)(\n  </OptionToggle>)',
+                   'Выделяет слова по частотности: 1 — самое частое слово, чем больше число, тем реже слово.'),
+                  (r'(<OptionNumber bind:value=\{\$minConfig\} title="От места"[^>]*>\n    )([\s\S]*?)(\n  </OptionNumber>)',
+                   'Слова чаще этого места не выделяются: их вы, скорее всего, знаете.'),
+                  (r'(<OptionNumber bind:value=\{\$maxConfig\} title="До места"[^>]*>\n    )([\s\S]*?)(\n  </OptionNumber>)',
+                   'Слова реже этого места не выделяются.'),
+                  (r'(<div class="note">\n    )(Отметьте уровни[\s\S]*?)(\n  </div>)',
+                   'Уровни JLPT, которые нужно выделять. Цвет уровня важнее цвета частотности. Списки составило сообщество.'),
+              ]
+              done = 0
+              for pattern, new in replacements:
+                  t, n = re.subn(pattern, lambda m, new=new: m.group(1) + new + m.group(3), t, count=1)
+                  done += n
+              p.write_text(t, encoding="utf-8")
+              print(f"highlight descriptions: {done} of {len(replacements)} replaced")
+          PY
+
+      - name: "Native player v1.30: decoding settings (hardware / async)"
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          def once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          s = once(s, '@State private var options = KSOptions()', """@State private var options = NativeVideoPlayerScreen.makeOptions()
+                        @AppStorage("ykHWDecode") private var ykHWDecode = true
+                        @AppStorage("ykAsyncDecode") private var ykAsyncDecode = true
+
+                        /// Decoding settings from the player menu, read when the video screen opens (applies to the next video).
+                        static func makeOptions() -> KSOptions {
+                            let d = UserDefaults.standard
+                            let o = KSOptions()
+                            o.hardwareDecode = d.object(forKey: "ykHWDecode") as? Bool ?? true
+                            o.asynchronousDecompression = d.object(forKey: "ykAsyncDecode") as? Bool ?? true
+                            return o
+                        }""", "options")
+          s = once(s, 'Section("Субтитры") {', """Section("Декодирование") {
+                                        Toggle("Аппаратное декодирование", isOn: $ykHWDecode)
+                                        Toggle("Асинхронное декодирование", isOn: $ykAsyncDecode)
+                                        Text("Применяется при следующем открытии видео").font(.caption).foregroundColor(.secondary)
+                                    }
+                                    Section("Субтитры") {""", "section")
+          p.write_text(s, encoding="utf-8")
+          print("v1.30 applied")
+          PY
+
+      - name: "Native player v1.31: buffer setting"
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          def once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          s = once(s, '@AppStorage("ykAsyncDecode") private var ykAsyncDecode = true',
+                   '@AppStorage("ykAsyncDecode") private var ykAsyncDecode = true\n              @AppStorage("ykBufferSec") private var ykBufferSec: Double = 3', "storage")
+          s = once(s, 'o.asynchronousDecompression = d.object(forKey: "ykAsyncDecode") as? Bool ?? true',
+                   'o.asynchronousDecompression = d.object(forKey: "ykAsyncDecode") as? Bool ?? true\n                  let buf = d.double(forKey: "ykBufferSec")\n                  o.preferredForwardBufferDuration = buf > 0 ? buf : 3.0', "make")
+          s = once(s, 'Toggle("Асинхронное декодирование", isOn: $ykAsyncDecode)',
+                   'Toggle("Асинхронное декодирование", isOn: $ykAsyncDecode)\n                              Picker("Буфер вперёд", selection: $ykBufferSec) {\n                                  Text("3 с").tag(3.0)\n                                  Text("6 с").tag(6.0)\n                                  Text("10 с").tag(10.0)\n                                  Text("15 с").tag(15.0)\n                              }', "picker")
+          p.write_text(s, encoding="utf-8")
+          print("v1.31 applied")
+          PY
+
+      - name: "Native player v1.32: sync decoding setting"
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          def once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          s = once(s, '@AppStorage("ykBufferSec") private var ykBufferSec: Double = 3',
+                   '@AppStorage("ykBufferSec") private var ykBufferSec: Double = 3\n              @AppStorage("ykSyncDecode") private var ykSyncDecode = false', "storage")
+          s = once(s, 'o.preferredForwardBufferDuration = buf > 0 ? buf : 3.0',
+                   'o.preferredForwardBufferDuration = buf > 0 ? buf : 3.0\n                  o.syncDecodeVideo = d.bool(forKey: "ykSyncDecode")', "make")
+          s = once(s, 'Text("Применяется при следующем открытии видео")',
+                   'Toggle("Синхронное декодирование видео", isOn: $ykSyncDecode)\n                              Text("Применяется при следующем открытии видео")', "toggle")
+          p.write_text(s, encoding="utf-8")
+          print("v1.32 applied")
+          PY
+
+      - name: "Native player v1.35: smooth frame pacing setting"
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          def once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          s = once(s, '@AppStorage("ykSyncDecode") private var ykSyncDecode = false',
+                   '@AppStorage("ykSyncDecode") private var ykSyncDecode = false\n              @AppStorage("ykSmoothPacing") private var ykSmoothPacing = false', "storage")
+          s = once(s, 'o.syncDecodeVideo = d.bool(forKey: "ykSyncDecode")',
+                   'o.syncDecodeVideo = d.bool(forKey: "ykSyncDecode")\n                  o.smoothPacing = d.bool(forKey: "ykSmoothPacing")', "make")
+          s = once(s, 'Toggle("Синхронное декодирование видео", isOn: $ykSyncDecode)',
+                   'Toggle("Синхронное декодирование видео", isOn: $ykSyncDecode)\n                              Toggle("Ровный шаг кадров (эксперимент)", isOn: $ykSmoothPacing)', "toggle")
+          p.write_text(s, encoding="utf-8")
+          print("v1.35 swift applied")
+          PY
+
+      - name: "Native player v1.37: settings cleanup"
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          def once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          import re
+          # 1) remove the synchronous decoding setting (toggle, storage and option line)
+          s = re.sub(r'[ \t]*@AppStorage\("ykSyncDecode"\)[^\n]*\n', '', s)
+          s = re.sub(r'[ \t]*o\.syncDecodeVideo = [^\n]*\n', '', s)
+          s = once(s, 'Toggle("Синхронное декодирование видео", isOn: $ykSyncDecode)\n', '', "synctoggle") if 'Toggle("Синхронное декодирование видео", isOn: $ykSyncDecode)\n' in s else s
+          # 2) rewrite the decoding section: hardware, async, smooth pacing, note, buffer last
+          start = s.index('Section("Декодирование") {')
+          end = s.index('Section("Субтитры") {')
+          block = """Section("Декодирование") {
+                                        Toggle("Аппаратное декодирование", isOn: $ykHWDecode)
+                                        Toggle("Асинхронное декодирование", isOn: $ykAsyncDecode)
+                                        Toggle("Ровный шаг кадров", isOn: $ykSmoothPacing)
+                                        Text("Применяется при следующем открытии видео").font(.caption).foregroundColor(.secondary)
+                                        Picker("Буфер вперёд", selection: $ykBufferSec) {
+                                            Text("3 с").tag(3.0)
+                                            Text("6 с").tag(6.0)
+                                            Text("10 с").tag(10.0)
+                                            Text("15 с").tag(15.0)
+                                        }
+                                    }
+                                    """
+          s = s[:start] + block + s[end:]
+          p.write_text(s, encoding="utf-8")
+          print("v1.37 applied")
+          PY
+
+      - name: "Native player v1.40: settings order"
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          s = p.read_text(encoding="utf-8")
+          def once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          start = s.index('Section("Декодирование") {')
+          end = s.index('Section("Субтитры") {')
+          block = """Section("Декодирование") {
+                                        Toggle("Аппаратное декодирование", isOn: $ykHWDecode)
+                                        Toggle("Асинхронное декодирование", isOn: $ykAsyncDecode)
+                                        Toggle("Ровный шаг кадров", isOn: $ykSmoothPacing)
+                                        Picker("Буфер вперёд", selection: $ykBufferSec) {
+                                            Text("3 с").tag(3.0)
+                                            Text("6 с").tag(6.0)
+                                            Text("10 с").tag(10.0)
+                                            Text("15 с").tag(15.0)
+                                        }
+                                        Text("Применяется при следующем открытии видео").font(.caption).foregroundColor(.secondary)
+                                    }
+                                    """
+          s = s[:start] + block + s[end:]
+          p.write_text(s, encoding="utf-8")
+          print("v1.39 settings order applied")
+          PY
+
+      - name: "Native player v1.42: clear sheet title bars, delete in the video list, hidden subtitle files, Jimaku on import"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v142-player.py"
+
+      - name: "Native player v1.44: season and episode badge in the video list"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v144-player.py"
+
+      - name: "Native player v1.45: precise seeks, seamless return from Anki, lookup card, picture enhancement"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v145-player.py"
+
+      - name: "Statistics v1.46: Anki import in totals and the added words, reading / watching switch"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v146-stats.py"
+
+      - name: "Native player v1.46: subtitle position, rotate button, lock screen player, watching statistics, coverage badge"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v146-player.py"
+
+      - name: "Native player v1.47: native settings (iOS 26 style)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v147-settings.py"
+
+      - name: "Native player v1.47: dictionary in the iOS 26 style"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v147-dictionary.py"
+
+      - name: "Native player v1.48: switch order, progress bar, tap closes lookup, Anki form, compact toolbar"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v148-fixes.py"
+
+      - name: "Native player v1.49: coverage over all word forms, subtitles deleted with the video"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v149-fixes.py"
+
+      - name: "Native player v1.50: crash after closing a video (coverage memory)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v150-fixes.py"
+
+      - name: "Native player v1.51: multi-file import, crash trail"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v151-fixes.py"
+
+      - name: "Native player v1.52: crash on close (lock screen buttons hold the player weakly)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v152-fixes.py"
+
+      - name: "Native player v1.53: delete alert and animation, parallel Jimaku search, drag files to folders, equal cards"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v153-fixes.py"
+
+      - name: "Native player v1.54: opening/ending skip, swipe seeking, subtitle line buttons, next episode"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v154-player.py"
+
+      - name: "Native player v1.55: difficulty badge and level, double tap replays the line"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v155-player.py"
+
+      - name: "Native player v1.56: frame in mined notes, mining queue"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v156-mining.py"
+
+      - name: "Native player v1.57: episode analysis by level and frequency, unknown words list"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v157-analysis.py"
+
+      - name: "Native player v1.58: word matching, folder badges, live swipe frames, coverage colour, covers"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v158-fixes.py"
+
+      - name: "Native player v1.59: vocabulary setting for the episode analysis"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v159-vocabulary.py"
+
+      - name: "Native player v1.60: episode analysis without half known words, saved results by the known words"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v160-analysis.py"
+
+      - name: "Native player v1.60: mining queue words counted when the note reaches Anki"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v160-mining-stats.py"
+
+      - name: "Native player v1.60: one tap adds to Anki (no preview form), also in Safari"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v160-one-tap-anki.py"
+
+      - name: "Native player v1.60: check mark instead of the add button for added and queued words"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v160-added-check.py"
+
+      - name: "Native player v1.61: moving to folders, start at the saved position, next episode, common queue, Safari known words, diagnostics page"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v161-fixes.py"
+
+      - name: "Native player v1.62: YouTube videos with Japanese captions, lookup and mining"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v162-youtube.py"
+
+      - name: "Native player v1.63: YouTube captions follow the video, landscape with captions over the picture"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v163-youtube.py"
+
+      - name: "Native player v1.64: swipe seeking keeps playing or paused as before"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v164-swipe.py"
+
+      - name: "Native player v1.65: review fixes (queue after a cancelled note, reset keeps Anki words, lookup keeps pause)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v165-fixes.py"
+
+      - name: "Native player v1.66: settings by path, safe Safari sync, queue frames in files, cleanup"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v166-fixes.py"
+
+      - name: "Native player v1.67: spinner on the add button until the note is added"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v167-adding-spinner.py"
+
+      - name: "Native player v1.68: subtitle lines keep up, queued words not highlighted"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v168-subtitles.py"
+
+      - name: "Satori v1.68: name and icon"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v168-satori.py"
+
+      - name: "Satori v1.69: extension icons, names, accent color"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v169-satori.py"
+
+      - name: "Native player v1.70: landscape dictionary panel animated and docked, YouTube delete like videos"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v170-lookup-panel.py"
+
+      - name: "Native player v1.71: catalog (Jiten library, coverage of any title)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v171-catalog.py"
+
+      - name: "Satori v1.72: reading tab (Syosetu web novels offline)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v172-reader.py"
+
+      - name: "Satori v1.73: interface, settings, watching statistics"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v173-ui.py"
+
+      - name: "Satori v1.73: catalog filters, sorting, background coverage"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v173-catalog.py"
+
+      - name: "Satori v1.73: reading (grades, volumes, place, queue, statistics)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v173-reader.py"
+
+      - name: "Satori v1.74: reading (smooth lists, folding volumes, search, chapters in the statistics)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v174-reader.py"
+
+      - name: "Satori v1.74: analysis (smarter rules, a faster catalog, all unknown words)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v174-analysis.py"
+
+      - name: "Satori v1.74: subtitle rows, statistics, unknown words into the queue, Safari without statistics"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v174-ui.py"
+
+      - name: "Satori v1.75: names and kana words in the analysis, the catalog within Jiten's limit"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v175-catalog.py"
+
+      - name: "Satori v1.75: volumes as rows"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v175-reader.py"
+
+      - name: "Satori v1.76: mature cards, speech speed, calibration, deleting imported words"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v176-analysis.py"
+
+      - name: "Satori v1.77: catalog two at a time in the background"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v177-catalog.py"
+
+      - name: "Satori v1.77: calibration fixes, JLPT estimate, frequent kanji"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v177-level.py"
+
+      - name: "Satori v1.77: dictionary examples in notes, decks open in Satori"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v177-anki.py"
+
+      - name: "Satori v1.78: reading statistics at a reading pace"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v178-reader.py"
+
+      - name: "Satori v1.78: calibration and JLPT estimate from one knowledge curve"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v178-level.py"
+
+      - name: "Satori v1.79: kanji progress instead of calibration and JLPT estimate"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v179-kanji.py"
+
+      - name: "Satori v1.79: accent color in settings, shorter texts"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v179-ui.py"
+
+      - name: "Satori v1.79: catalog descriptions, genres, ratings, quick switching"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v179-catalog.py"
+
+      - name: "Satori v1.80: smart furigana, search in the chapter"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v180-reader.py"
+
+      - name: "Satori v1.80: sound of the line in the note"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v180-audio.py"
+
+      - name: "Satori v1.81: sound of the line as a real Anki sound"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v181-audio.py"
+
+      - name: "Satori v1.82: glosses after dots, framed examples in the note"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v182-anki.py"
+
+      - name: "Satori v1.83: line sound from the playing track, cap of the glosses"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v183-fixes.py"
+
+      - name: "Satori v1.84: Jimaku reads Chapter NN names"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v184-jimaku.py"
+
+      - name: "Satori v1.85: import queue, clip server, highlight forms, deck import, appearance"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v185-fixes.py"
+
+      - name: "Satori v1.86: subtitles without SDH, furigana in the player, word marks, live background"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v186-ideas.py"
+
+      - name: "Satori v1.87: known words from AnkiMobile backups, full notes from the unknown words"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v187-anki.py"
+
+      - name: "Satori v1.88: the meaning that fits the sentence"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v188-context.py"
+
+      - name: "Satori v1.88: inline titles of the root lists (no jump on the way back)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v188-nav.py"
+
+      - name: "Satori v1.89: live background in the dictionary tab, livelier background"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v189-dictionary.py"
+
+      - name: "Satori v1.90: folder picker of UIKit, smoother background"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v190-fixes.py"
+
+      - name: "Satori v1.91: settings of the live background"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v191-backdrop.py"
+
+      - name: "Satori v1.92: folder picker shown by UIKit, a backup chosen as a file"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v192-backups.py"
+
+      - name: "Satori v1.93: whole furigana words, wandering background, backups from the Anki folder, faster add"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v193-fixes.py"
+
+      - name: "Satori v1.94: Jimaku for raw videos, films and dramas, videos from Files"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v194-subtitles.py"
+
+      - name: "Satori v1.94: furigana over its own kanji"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v194-furigana.py"
+
+      - name: "Satori v1.95: the backup folder can be chosen (no deck document types)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v195-folder.py"
+
+      - name: "Satori v1.96: check marks of kana words, highlight in the unknown-word lists, backup folder steps"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v196-fixes.py"
+
+      - name: "Satori v1.97: check mark of the tapped entry, lists follow the queue, backups from Shortcuts"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v197-fixes.py"
+
+      - name: "Satori v1.98: backups per profile, the older folder picker, the background stops under the picker"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v198-backups.py"
+
+      - name: "Satori v2.00: grammar decks N5-N1 (check)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/assets/grammar/check.py"
+
+      - name: "Satori v2.00: grammar decks N5-N1 with FSRS, level test, grammar in the difficulty"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v200-grammar.py"
+
+      - name: "Satori v2.01: the backups folder by ticking, by dragging from Files, and a check of the picker"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v201-backups.py"
+
+      - name: "Satori v2.02: the level test opens, equal answer capsules, new cards per deck"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v202-grammar-fixes.py"
+
+      - name: "Satori v2.03: the signature of the install (entitlements, profile, libraries) in Settings"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v203-signature.py"
+
+      - name: "Satori v2.04: moving the data of the old install to the new one"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v204-transfer.py"
+
+      - name: "Satori v2.05: the check mark after a queued note, the certificate's bundle ID"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v205-fixes.py"
+
+      - name: "Satori v2.06: the settings without web pages and explanations, native Anki template, backup interval"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v206-settings.py"
+
+      - name: "Satori v2.07: grammar statistics, the reader background, a folder's unknown words and subtitles"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v207-stats-folders.py"
+
+      - name: "Satori v2.08: faster (background, storage, subtitles, regexes, names) and smoother"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v208-speed-motion.py"
+
+      - name: "Satori v2.09: grammar marks, the card fade, «О приложении», queued words, Apple's voice"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v209-fixes.py"
+
+      - name: "Satori v2.10: the voice of Satori in the settings, the folder of iTorrent in «Видео»"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v210-voice-linked.py"
+
+      - name: "Satori v2.11: the furigana of the subtitles closer to the kanji, the strength of Anime4K"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v211-player.py"
+
+      - name: "Satori v2.12: the speech settings of iOS for the voice"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v212-fixes.py"
+
+      - name: "Satori v2.13: progress, the order of the statistics, streaks from 10 minutes, the frame watch, YouTube phrases"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v213-stats.py"
+
+      - name: "Satori v2.14: subtitles from the sound of a video (iOS 26 speech recognition, ahead of the playback)"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v214-speech.py"
+
+      - name: "Satori v2.15: the grammar sentences read by a neural voice, the progress in place of the 7 days"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v215-voice-progress.py"
+
+      - name: "Satori v2.16: the smart furigana cut by kanji, over the kanji only, without the JLPT rule"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v216-furigana.py"
+
+      - name: "Satori v2.17: the page translator of Google, only ready notes leave the mining queue"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v217-queue.py"
+
+      - name: "Satori v2.18: the mining queue goes to AnkiMobile as one package"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v218-batch.py"
+
+      - name: "Satori v2.19: the package waits for the backup, quick adding, the translator retries"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v219-fixes.py"
+
+      - name: "Satori v2.20: the analyses once a day in the background, the package finds the note type"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v220-daily.py"
+
+      - name: "Satori v2.21: the word audio of JapanesePod101 downloaded ahead, onto the phone"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v221-word-audio.py"
+
+      - name: "Satori v2.22: the note types of the backup read first and never lost"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v222-models.py"
+
+      - name: "Satori v2.23: the note types of the backup read by the first query that works"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v223-models.py"
+
+      - name: "Satori v2.24: the backup of AnkiMobile read without Anki's collation unicase"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v224-unicase.py"
+
+      - name: "Satori v2.25: a package from 10 notes, «Отправить все» the button of the queue"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v225-queue-send.py"
+
+      - name: "Satori v2.26: mining in the player with the fingers that hold the phone"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v226-player-mining.py"
+
+      - name: "Satori v2.27: the dictionary of the player ready at once, closed by a tap along the top"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v227-player-lookup.py"
+
+      - name: "Satori v2.28: the furigana of numbers in the Anki fields"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v228-anki-furigana.py"
+
+      - name: "Satori v2.29: Jimaku downloads only from jimaku.cc, ASS first, Japanese styles only"
+        run: |
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v229-jimaku-safe.py"
+
+      - name: Pre-generate files that Xcode expects to already exist
+        working-directory: src
+        run: |
+          pnpm generate:release
+          pnpm build:ios
+
+      - name: Make the "Set Build Version" script safe
+        working-directory: src
+        run: |
+          # The original script fails the whole build when CFBundleVersion already exists
+          # (or git/Info.plist are not ready). The final version is written again when packaging the .ipa.
+          cat > safari/scripts/set_build_version.sh <<'SH'
+          #!/bin/bash
+          bundleVersion=$(git log -1 --date=format:"%Y%m%d%H%M%S" --format="%ad" 2>/dev/null || true)
+          if [ -z "$bundleVersion" ]; then
+            bundleVersion=$(date +%Y%m%d%H%M%S)
+          fi
+          plist="${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          if [ -f "$plist" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $bundleVersion" "$plist" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $bundleVersion" "$plist" 2>/dev/null \
+              || true
+          fi
+          exit 0
+          SH
+          chmod +x safari/scripts/set_build_version.sh
+          cat safari/scripts/set_build_version.sh
+
+      - name: Build iOS app (unsigned)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          PROJ=safari/Yomikiri.xcodeproj
+          xcodebuild -list -project "$PROJ"
+          SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "
+          import json, sys
+          s = json.load(sys.stdin)['project']['schemes']
+          bad = ('extension', 'tokenizer', 'test')
+          good = [x for x in s if 'yomikiri' in x.lower() and not any(b in x.lower() for b in bad)]
+          print((good or s)[0])
+          ")
+          echo "Scheme: $SCHEME"
+          SPM_DIR="$PWD/spm"
+          # resolve packages into a known folder, then patch KSPlayer before compiling
+          xcodebuild -resolvePackageDependencies -project "$PROJ" -scheme "$SCHEME" -clonedSourcePackagesDirPath "$SPM_DIR"
+          # SwiftPM checkouts are read-only: make the KSPlayer checkout writable before patching it
+          chmod -R u+w spm/checkouts/KSPlayer
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/ksplayer_build_patches.py"
+          # Anime4K Restore CNN S (MIT, (c) bloc97): converted to Metal for the line restoration filter
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/Anime4K_Restore_CNN_S.glsl" "https://raw.githubusercontent.com/bloc97/Anime4K/master/glsl/Restore/Anime4K_Restore_CNN_S.glsl" || echo "Anime4K shader not downloaded: line restoration will be unavailable"
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v145-ksplayer.py" "$RUNNER_TEMP/Anime4K_Restore_CNN_S.glsl"
+          # heavier kinds (v2.11, converted and compiled by v212-anime4k.py since 2.12): Anime4K Restore CNN M and L
+          for kind in M L; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/Anime4K_Restore_CNN_$kind.glsl" "https://raw.githubusercontent.com/bloc97/Anime4K/master/glsl/Restore/Anime4K_Restore_CNN_$kind.glsl" || echo "Anime4K $kind not downloaded"
+          done
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v212-anime4k.py" "$RUNNER_TEMP/Anime4K_Restore_CNN_M.glsl" "$RUNNER_TEMP/Anime4K_Restore_CNN_L.glsl"
+          python3 "$GITHUB_WORKSPACE/ours/ci/patches/v213-anime4k.py"
+          xcodebuild \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -clonedSourcePackagesDirPath "$SPM_DIR" -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            MARKETING_VERSION=${{ env.APP_VERSION }} CURRENT_PROJECT_VERSION=${{ env.APP_VERSION }} \
+            build 2>&1 | tee xcodebuild.log
+      - name: Show build errors
+        if: always()
+        working-directory: src
+        run: |
+          [ -f xcodebuild.log ] || exit 0
+          echo "=== lines with errors ==="
+          grep -n -B3 -A6 "error:\|fatal:\|Entry Already\|Error Reading\|Command PhaseScriptExecution failed" xcodebuild.log | head -250 || true
+          # the compiler errors also as annotations: they can be read without signing in to GitHub
+          grep -E "(error|fatal error): " xcodebuild.log | sed -E 's#^.*/src/##' | sort -u | head -40 | while IFS= read -r line; do
+            line=${line//%/%25}
+            echo "::error title=xcodebuild::${line}"
+          done || true
+
+      - name: Package .ipa
+        working-directory: src
+        env:
+          GROUP_PREFIX: group.e9b3f7cfcd7710ea
+          BUNDLE_ID: app.uva7695.libra5806
+          TEAM_ID: L3R6H56C8T
+          EMBED_ENTITLEMENTS: ${{ inputs.entitlements }}
+          FULL_ENTITLEMENTS: ${{ inputs.full_entitlements }}
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products -maxdepth 2 -name '*.app' | head -n1)
+          echo "App: $APP"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          APPDIR="ipa/Payload/$(basename "$APP")"
+          HL_OUT="$APPDIR/res/hl" python3 - <<'HL'
+          import base64, json, os, pathlib, re
+
+          # runs when the .ipa is packed (Xcode rebuilds and cleans the web output itself): frequency and JLPT tables
+          # are written as binary files into the built app (res/hl), read by the app for the subtitle highlight
+          hl = pathlib.Path(os.environ.get("HL_OUT", "main/build/iosapp/res/hl"))
+          hl.mkdir(parents=True, exist_ok=True)
+          jl = pathlib.Path("main/src/extension/background/jlptData.ts")
+          if jl.exists():
+              m = re.search(r'export const JLPT_DATA = "([^"]*)"', jl.read_text(encoding="utf-8"))
+              if m and m.group(1):
+                  (hl / "jlpt.bin").write_bytes(base64.b64decode(m.group(1)))
+                  print("jlpt table written")
+          fr = pathlib.Path("main/src/extension/background/frequencyData.ts")
+          if fr.exists():
+              text = fr.read_text(encoding="utf-8")
+              dicts = json.loads(text[text.index("=") + 1:].strip().rstrip(";"))
+              index = []
+              for d in dicts:
+                  name = "freq_" + re.sub(r"[^A-Za-z0-9_-]", "_", d["id"])
+                  (hl / (name + ".bin")).write_bytes(base64.b64decode(d["data"]))
+                  index.append({"id": d["id"], "name": d["name"], "file": name + ".bin"})
+              (hl / "index.json").write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+              print("frequency tables written:", len(index))
+          HL
+          # the grammar decks (v2.00), read by the app from res/grammar
+          mkdir -p "$APPDIR/res/grammar"
+          cp "$GITHUB_WORKSPACE"/ours/ci/assets/grammar/n*.json "$APPDIR/res/grammar/"
+          # the sentences read in advance (v2.15, ci/assets/grammar/voice.py)
+          mkdir -p "$APPDIR/res/grammar/audio"
+          cp "$GITHUB_WORKSPACE"/ours/ci/assets/grammar/audio/*.mp3 "$APPDIR/res/grammar/audio/"
+          echo "grammar audio: $(ls "$APPDIR/res/grammar/audio" | wc -l) files"
+          # the third-party licences for «О приложении» (v2.09)
+          LICENSES=$(find extra/generate-license -name THIRD_PARTY.txt 2>/dev/null | head -n1 || true)
+          if [ -n "$LICENSES" ]; then
+            cp "$LICENSES" "$APPDIR/res/THIRD_PARTY.txt"
+            ls -la "$APPDIR/res/THIRD_PARTY.txt"
+          else
+            echo "no THIRD_PARTY.txt: «О приложении» goes without the licences"
+          fi
+          PLIST="$APPDIR/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Satori" "$PLIST" || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Satori" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Satori" "$PLIST" || true
+          # app version in the app, the extensions and the frameworks
+          for P in "$PLIST" "$APPDIR"/PlugIns/*.appex/Info.plist "$APPDIR"/Frameworks/*.framework/Info.plist; do
+            [ -f "$P" ] || continue
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$P" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $APP_VERSION" "$P"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$P" || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $APP_VERSION" "$P"
+          done
+          # the bundle ID the certificate is for (v2.05): with another one iOS gives Satori no folder in the picker;
+          # the extensions keep their suffix after it
+          for P in "$PLIST" "$APPDIR"/PlugIns/*.appex/Info.plist; do
+            [ -f "$P" ] || continue
+            OLD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$P")
+            case "$OLD" in com.yoonchae.Yomikiri*) ;; *) continue ;; esac
+            NEW="$BUNDLE_ID${OLD#com.yoonchae.Yomikiri}"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $NEW" "$P"
+            echo "bundle ID: $OLD -> $NEW"
+          done
+          if [ "$EMBED_ENTITLEMENTS" != "false" ]; then
+            # Put the App Group into the entitlements of the app and the extensions,
+            # so the signing tool keeps it and they can share settings and statistics.
+            APP_GROUPS_XML="<string>$GROUP_PREFIX.1</string>"
+            KEYCHAIN_XML=""
+            if [ "$FULL_ENTITLEMENTS" != "false" ]; then
+              # all groups of the profile (the app and the extensions can then find a common one)
+              # and a shared keychain group, covered by the profile's "TEAM.*" wildcard
+              for i in 2 3 4 5; do
+                APP_GROUPS_XML="$APP_GROUPS_XML<string>$GROUP_PREFIX.$i</string>"
+              done
+              KEYCHAIN_XML="<key>keychain-access-groups</key><array><string>$TEAM_ID.yomikiri.shared</string></array>"
+            fi
+            cat > /tmp/ent.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.application-groups</key>
+            <array>$APP_GROUPS_XML</array>
+            $KEYCHAIN_XML
+          </dict>
+          </plist>
+          EOF
+            for f in "$APPDIR"/Frameworks/*.framework; do
+              codesign --force --sign - --timestamp=none "$f"
+            done
+            for x in "$APPDIR"/PlugIns/*.appex; do
+              codesign --force --sign - --timestamp=none --entitlements /tmp/ent.plist "$x"
+            done
+            codesign --force --sign - --timestamp=none --entitlements /tmp/ent.plist "$APPDIR"
+            for x in "$APPDIR" "$APPDIR"/PlugIns/*.appex; do
+              echo "== entitlements of $x"
+              codesign -d --entitlements :- "$x" 2>&1 | head -20 || true
+            done
+          else
+            find ipa/Payload \( -name "*.appex" -o -name "*.framework" -o -name "*.app" \) -print0 | xargs -0 -I{} codesign --remove-signature "{}" || true
+          fi
+          (cd ipa && zip -qry ../Satori-v${{ env.APP_VERSION }}.ipa Payload)
+          ls -la Satori-v${{ env.APP_VERSION }}.ipa
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Satori-v${{ env.APP_VERSION }}-ipa
+          path: src/Satori-v${{ env.APP_VERSION }}.ipa
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-v${{ env.APP_VERSION }}
+          path: src/xcodebuild.log
+          if-no-files-found: ignore
