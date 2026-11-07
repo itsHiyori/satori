@@ -17,3 +17,12 @@ jobs:
       - run: |
           lipo -info "$RUNNER_TEMP/lt-out/lib/libtorrent-rasterbar.a"
           du -sh "$RUNNER_TEMP/lt-out/lib" "$RUNNER_TEMP/lt-out/boost"
+      - name: Compile the Objective-C++ bridge against it
+        run: |
+          O="$RUNNER_TEMP/lt-out"
+          xcrun --sdk iphoneos clang++ -x objective-c++ -std=gnu++17 -fobjc-arc -arch arm64 -mios-version-min=16.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -I "$O/include" -I "$O/boost" -I ci/torrent/bridge \
+            -DBOOST_ASIO_NO_DEPRECATED -DTORRENT_NO_DEPRECATE \
+            -c ci/torrent/bridge/SatoriTorrent.mm -o "$RUNNER_TEMP/SatoriTorrent.o"
+          ls -la "$RUNNER_TEMP/SatoriTorrent.o"
