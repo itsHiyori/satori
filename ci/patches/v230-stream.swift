@@ -39,6 +39,7 @@ enum Rx {
 }
 
 /// The choice of the release and of the file, as in anicli-ru-jimaku: a batch that holds the episode, then one file of it.
+@available(iOS 16.0, *)
 enum TorrentSearch {
     struct Release {
         let name: String
