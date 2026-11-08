@@ -14,32 +14,18 @@ here = pathlib.Path(__file__).resolve().parent
 hv = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
 s = hv.read_text(encoding="utf-8")
 
-s = once(s, "    @State private var linkedFolders: [URL] = []\n",
-         "    @State private var linkedFolders: [URL] = []\n    @State private var showOnline = false\n", "online state")
+# shown by UIKit, like the folder picker next to it: a navigationDestination, a hidden NavigationLink and a sheet
+# set from this menu never opened
 s = once(s, '''                            Label("Привязать папку (iTorrent)", systemImage: "link")
                         }
 ''', '''                            Label("Привязать папку (iTorrent)", systemImage: "link")
                         }
                         Button {
-                            showOnline = true
+                            OnlineWatchView.present()
                         } label: {
                             Label("Смотреть онлайн", systemImage: "play.circle")
                         }
 ''', "online menu item")
-# next to the YouTube sheet, which opens from the same menu (a sheet on the inner list never showed)
-s = once(s, '''        .sheet(isPresented: $showYouTube) {
-''', '''        .sheet(isPresented: $showOnline) {
-            NavigationView {
-                OnlineWatchView()
-                    .toolbar {
-                        ToolbarItem(placement: .navigationBarLeading) {
-                            Button("Закрыть") { showOnline = false }
-                        }
-                    }
-            }
-        }
-        .sheet(isPresented: $showYouTube) {
-''', "online sheet")
 s = s.rstrip("\n") + "\n" + (here / "v230-stream.swift").read_text(encoding="utf-8")
 hv.write_text(s, encoding="utf-8")
 

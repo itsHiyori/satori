@@ -533,6 +533,28 @@ final class OnlineWatch: ObservableObject {
 /// «Видео» → «+» → «Смотреть онлайн»: a title, an episode, and the episode plays while it downloads.
 @available(iOS 16.0, *)
 struct OnlineWatchView: View {
+    /// Shown by UIKit from the top screen, like FolderPick: SwiftUI presentations set from the «+» menu never opened.
+    @MainActor
+    static func present() {
+        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
+        guard var top = (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController else { return }
+        while let shown = top.presentedViewController {
+            top = shown
+        }
+        weak var host: UIViewController?
+        let screen = UIHostingController(rootView: NavigationView {
+            OnlineWatchView()
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button("Закрыть") { host?.dismiss(animated: true) }
+                    }
+                }
+        }
+        .navigationViewStyle(.stack))
+        host = screen
+        top.present(screen, animated: true)
+    }
+
     @StateObject private var watch = OnlineWatch()
     @State private var query = ""
     @State private var entries: [JimakuService.Entry] = []
