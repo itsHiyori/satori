@@ -2,6 +2,9 @@
 # Nyaa, the file of the episode inside it (as in anicli-ru-jimaku), and the player gets it from a local server while
 # the torrent downloads; the Jimaku subtitles are put next to the address the player is given. Nothing is kept: the
 # downloaded part is deleted when the player is closed.
+# Настройки → Диагностика → «Проверки»: the build number, free space, Jimaku, Nyaa, the torrent engine with the local
+# server, showing a screen; the steps of «Смотреть онлайн» go to the trail.
+import os
 import pathlib
 
 
@@ -26,7 +29,18 @@ s = once(s, '''                            Label("Привязать папку 
                             Label("Смотреть онлайн", systemImage: "play.circle")
                         }
 ''', "online menu item")
-s = s.rstrip("\n") + "\n" + (here / "v230-stream.swift").read_text(encoding="utf-8")
+# Настройки → Диагностика: the checks of the phone (network, Jimaku, Nyaa, the torrent engine, showing a screen)
+s = once(s, '''                Text("Синхронизация с расширением")
+            }
+''', '''                Text("Синхронизация с расширением")
+            }
+
+            if #available(iOS 16.0, *) {
+                DiagnosticChecksSection()
+            }
+''', "diagnostics checks")
+swift = (here / "v230-stream.swift").read_text(encoding="utf-8")
+s = s.rstrip("\n") + "\n" + swift.replace("@@BUILD@@", os.environ.get("GITHUB_RUN_NUMBER", "локальная"))
 hv.write_text(s, encoding="utf-8")
 
 # ---------- the Xcode project: the bridge library for the app target only ----------

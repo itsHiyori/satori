@@ -534,25 +534,38 @@ final class OnlineWatch: ObservableObject {
 @available(iOS 16.0, *)
 struct OnlineWatchView: View {
     /// Shown by UIKit from the top screen, like FolderPick: SwiftUI presentations set from the «+» menu never opened.
+    /// Every step goes to the trail (Настройки → Диагностика → Журнал): the screen never opened on the phone and
+    /// there was no log to tell why.
     @MainActor
-    static func present() {
-        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
-        guard var top = (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController else { return }
-        while let shown = top.presentedViewController {
-            top = shown
-        }
-        weak var host: UIViewController?
-        let screen = UIHostingController(rootView: NavigationView {
-            OnlineWatchView()
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarLeading) {
-                        Button("Закрыть") { host?.dismiss(animated: true) }
+    static func present(from place: String = "меню") {
+        CrashTrail.mark("онлайн: нажато (\(place)), сборка \(DiagnosticChecks.build)")
+        Task { @MainActor in
+            // the «+» menu is still closing while its button runs
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard let top = DiagnosticChecks.topController() else {
+                CrashTrail.mark("онлайн: нет окна для показа")
+                return
+            }
+            CrashTrail.mark("онлайн: показываю над \(type(of: top))")
+            weak var host: UIViewController?
+            let screen = UIHostingController(rootView: NavigationView {
+                OnlineWatchView()
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarLeading) {
+                            Button("Закрыть") { host?.dismiss(animated: true) }
+                        }
                     }
-                }
+            }
+            .navigationViewStyle(.stack))
+            host = screen
+            top.present(screen, animated: true) {
+                CrashTrail.mark("онлайн: показ завершён")
+            }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if screen.view.window == nil {
+                CrashTrail.mark("онлайн: экран не попал в окно, сверху \(type(of: DiagnosticChecks.topController() ?? top))")
+            }
         }
-        .navigationViewStyle(.stack))
-        host = screen
-        top.present(screen, animated: true)
     }
 
     @StateObject private var watch = OnlineWatch()
@@ -623,6 +636,9 @@ struct OnlineWatchView: View {
             }, isActive: Binding(get: { watch.playURL != nil },
                                  set: { if !$0 { watch.stop() } })) { EmptyView() }
         )
+        .onAppear {
+            CrashTrail.mark("онлайн: экран появился")
+        }
         .onDisappear {
             if watch.playURL == nil {
                 watch.stop()
@@ -647,6 +663,128 @@ struct OnlineWatchView: View {
                 searchMessage = "Нет связи с Jimaku"
             }
             searching = false
+        }
+    }
+}
+
+/// Настройки → Диагностика → «Проверки»: each check says what works on this phone. A new check is one more line in
+/// `all`.
+@available(iOS 16.0, *)
+enum DiagnosticChecks {
+    /// the run number of the GitHub build (the app version stays the same between builds)
+    static let build = "@@BUILD@@"
+
+    struct Failure: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    @MainActor
+    static let all: [(String, @MainActor () async throws -> String)] = [
+        ("Сборка", {
+            let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+            return "\(version) (сборка \(build)), iOS \(UIDevice.current.systemVersion), \(UIDevice.current.model)"
+        }),
+        ("Свободное место", {
+            let values = try URL(fileURLWithPath: NSHomeDirectory())
+                .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            let free = values.volumeAvailableCapacityForImportantUsage ?? 0
+            guard free > 2_000_000_000 else { throw Failure(message: "мало: \(free / 1_000_000) МБ, серии нужно ~1-2 ГБ") }
+            return "\(free / 1_000_000_000) ГБ"
+        }),
+        ("Ключ Jimaku", {
+            guard JimakuKeychain.read() != nil else { throw Failure(message: "нет ключа: «+» → «Ключ Jimaku»") }
+            return "есть"
+        }),
+        ("Поиск в Jimaku", {
+            guard let key = JimakuKeychain.read() else { throw Failure(message: "нет ключа") }
+            let found = try await JimakuService.search("Frieren", key: key)
+            guard !found.isEmpty else { throw Failure(message: "ответ пустой") }
+            return "найдено \(found.count)"
+        }),
+        ("Поиск раздач (Nyaa)", {
+            let found = try await TorrentSearch.search("Sousou no Frieren")
+            guard !found.isEmpty else { throw Failure(message: "ответ пустой") }
+            return "найдено \(found.count), лучший: \(found.map { $0.seeders }.max() ?? 0) сидов"
+        }),
+        ("Торрент-движок и локальный сервер", {
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("satori-check")
+            let torrent = SatoriTorrent(savePath: folder.path)
+            defer { torrent.stopAndDelete() }
+            let server = StreamServer(torrent: torrent)
+            defer { server.stop() }
+            guard await server.start() else { throw Failure(message: "сервер не запустился") }
+            return "сервер на порту \(server.port)"
+        }),
+        ("Показ экрана поверх приложения", {
+            guard let top = topController() else { throw Failure(message: "нет окна") }
+            let probe = UIHostingController(rootView: Text("Проверка показа"))
+            top.present(probe, animated: true)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let shown = probe.view.window != nil
+            probe.dismiss(animated: true)
+            guard shown else { throw Failure(message: "экран не появился над \(type(of: top))") }
+            return "работает над \(type(of: top))"
+        }),
+    ]
+
+    /// The screen on top of the app: modal screens shown by UIKit are presented from it.
+    @MainActor
+    static func topController() -> UIViewController? {
+        let windows = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }
+        guard var top = (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController else { return nil }
+        while let shown = top.presentedViewController, !shown.isBeingDismissed {
+            top = shown
+        }
+        return top
+    }
+
+    @MainActor
+    static func runAll() async -> String {
+        var lines: [String] = []
+        for (name, check) in all {
+            do {
+                lines.append("✓ \(name): " + (try await check()))
+            } catch {
+                lines.append("✗ \(name): \(error.localizedDescription)")
+            }
+        }
+        let text = lines.joined(separator: "\n")
+        CrashTrail.mark("проверки:\n" + text)
+        return text
+    }
+}
+
+@available(iOS 16.0, *)
+struct DiagnosticChecksSection: View {
+    @State private var report = ""
+    @State private var running = false
+
+    var body: some View {
+        Section {
+            if !report.isEmpty {
+                Text(report)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                Button("Скопировать") {
+                    UIPasteboard.general.string = report
+                }
+            }
+            Button(running ? "Проверяю…" : "Запустить проверки") {
+                running = true
+                Task {
+                    report = await DiagnosticChecks.runAll()
+                    running = false
+                }
+            }
+            .disabled(running)
+            Button("Открыть «Смотреть онлайн» отсюда") {
+                OnlineWatchView.present(from: "диагностика")
+            }
+        } header: {
+            Text("Проверки")
+        } footer: {
+            Text("Результат проверок и шаги «Смотреть онлайн» пишутся в журнал выше.")
         }
     }
 }
