@@ -513,11 +513,13 @@ final class OnlineWatch: ObservableObject {
         for second in 0..<60 {
             files = torrent.files()
             if files != nil { break }
-            status = "\(chosen)\nИщу раздающих, список файлов… \(second) с, пиров: \(torrent.peerCount())"
+            status = "\(chosen)\nИщу раздающих, список файлов… \(second) с\n\(torrent.diagnostics())"
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
         guard let files else {
-            throw TorrentSearch.Failure(message: "Не удалось получить список файлов: проверьте раздающих")
+            // what the session saw goes to the journal: the next release replaces the status
+            CrashTrail.mark("онлайн: нет списка файлов\n" + torrent.diagnostics())
+            throw TorrentSearch.Failure(message: "Не удалось получить список файлов\n" + torrent.diagnostics())
         }
         let file = try TorrentSearch.episodeFile(files, episode: episode)
         guard torrent.selectFile(Int32(file.index)) else {
@@ -535,10 +537,11 @@ final class OnlineWatch: ObservableObject {
             if torrent.availableBytes(fromOffset: 0) >= need { break }
             // set again every second: a deadline that has passed is not served, and the first pieces were never asked for
             torrent.prioritize(fromOffset: 0)
-            status = "\(chosen)\nФайл \(file.size / 1024 / 1024) МБ, скачано \(torrent.downloadedBytes() / 1024 / 1024) МБ, \(torrent.downloadRate() / 1024) КБ/с, пиров: \(torrent.peerCount())"
+            status = "\(chosen)\nФайл \(file.size / 1024 / 1024) МБ, скачано \(torrent.downloadedBytes() / 1024 / 1024) МБ, \(torrent.downloadRate() / 1024) КБ/с\n\(torrent.diagnostics())"
             try await Task.sleep(nanoseconds: 1_000_000_000)
             if second == 119 {
-                throw TorrentSearch.Failure(message: "Слишком медленно: начало серии не скачалось за 2 минуты")
+                CrashTrail.mark("онлайн: начало серии не скачалось\n" + torrent.diagnostics())
+                throw TorrentSearch.Failure(message: "Слишком медленно: начало серии не скачалось за 2 минуты\n" + torrent.diagnostics())
             }
         }
         let server = StreamServer(torrent: torrent)

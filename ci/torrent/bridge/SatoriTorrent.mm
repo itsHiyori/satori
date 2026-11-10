@@ -9,7 +9,12 @@
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <libtorrent/announce_entry.hpp>
+#include <libtorrent/session_stats.hpp>
 #include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
 #include <mutex>
 #include <memory>
 
@@ -35,6 +40,9 @@
     int _selected;
     bool _configured;
     std::mutex _lock;
+    std::map<std::string, int> _ends; // why peer connections ended, by reason
+    int _attempts;
+    int _dhtNodes;
 }
 
 - (instancetype)initWithSavePath:(NSString *)savePath {
@@ -42,14 +50,17 @@
         _savePath = [savePath copy];
         _selected = -1;
         _configured = false;
+        _attempts = 0;
+        _dhtNodes = -1;
         [[NSFileManager defaultManager] createDirectoryAtPath:savePath withIntermediateDirectories:YES attributes:nil error:nil];
         lt::settings_pack pack;
         pack.set_str(lt::settings_pack::user_agent, "Satori/2.30");
-        pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:0");
+        pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:0,[::]:0"); // IPv6 too: mobile networks
         pack.set_bool(lt::settings_pack::enable_dht, true);
         pack.set_bool(lt::settings_pack::enable_lsd, false);
         pack.set_int(lt::settings_pack::upload_rate_limit, 64 * 1024); // streaming, not seeding
-        pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status);
+        pack.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::status
+                     | lt::alert_category::peer | lt::alert_category::connect);
         _session = std::make_unique<lt::session>(pack);
     }
     return self;
@@ -243,6 +254,67 @@
         return _handle.is_valid() ? _handle.status({}).num_peers : 0;
     } catch (...) {
         return 0;
+    }
+}
+
+- (NSString *)diagnostics {
+    std::lock_guard<std::mutex> guard(_lock);
+    try {
+        if (!_session || !_handle.is_valid()) {
+            return @"";
+        }
+        std::vector<lt::alert *> alerts;
+        _session->pop_alerts(&alerts);
+        for (lt::alert *a : alerts) {
+            if (auto *d = lt::alert_cast<lt::peer_disconnected_alert>(a)) {
+                _ends[d->error.message()]++;
+            } else if (auto *e = lt::alert_cast<lt::peer_error_alert>(a)) {
+                _ends[e->error.message()]++;
+            } else if (lt::alert_cast<lt::peer_connect_alert>(a)) {
+                _attempts++;
+            } else if (auto *s = lt::alert_cast<lt::dht_stats_alert>(a)) {
+                int nodes = 0;
+                for (auto const &bucket : s->routing_table) {
+                    nodes += bucket.num_nodes;
+                }
+                _dhtNodes = nodes;
+            }
+        }
+        _session->post_dht_stats(); // answered by the next call
+
+        lt::torrent_status st = _handle.status({});
+        std::string out = "пиров " + std::to_string(st.num_peers) + ", известно " + std::to_string(st.list_peers)
+            + ", попыток " + std::to_string(_attempts) + ", DHT-узлов " + (_dhtNodes < 0 ? std::string("?") : std::to_string(_dhtNodes));
+        for (const lt::announce_entry &tracker : _handle.trackers()) {
+            std::string state = "ответа пока нет";
+            for (const auto &endpoint : tracker.endpoints) {
+                const auto &v1 = endpoint.info_hashes[lt::protocol_version::V1];
+                if (v1.last_error) {
+                    state = v1.last_error.message();
+                } else if (v1.start_sent && v1.fails == 0) {
+                    state = "ответил";
+                    break;
+                }
+                if (!v1.message.empty()) {
+                    state += " (" + v1.message + ")";
+                }
+            }
+            std::string url = tracker.url;
+            auto from = url.find("://");
+            from = from == std::string::npos ? 0 : from + 3;
+            out += "\n" + url.substr(from, url.find_first_of(":/", from) - from) + ": " + state;
+        }
+        std::vector<std::pair<int, std::string>> ends;
+        for (auto const &entry : _ends) {
+            ends.emplace_back(entry.second, entry.first);
+        }
+        std::sort(ends.rbegin(), ends.rend());
+        for (size_t i = 0; i < ends.size() && i < 3; i++) {
+            out += "\nобрыв ×" + std::to_string(ends[i].first) + ": " + ends[i].second;
+        }
+        return [NSString stringWithUTF8String:out.c_str()] ?: @"";
+    } catch (...) {
+        return @"";
     }
 }
 

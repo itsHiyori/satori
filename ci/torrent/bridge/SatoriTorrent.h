@@ -30,6 +30,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Download speed in bytes per second, and the number of peers.
 - (long long)downloadRate;
 - (int)peerCount;
+/// What the session sees, a line per fact: peers, the DHT, each tracker's answer, why connections ended.
+- (NSString *)diagnostics;
 /// Stops the session and deletes everything it saved.
 - (void)stopAndDelete;
 @end
