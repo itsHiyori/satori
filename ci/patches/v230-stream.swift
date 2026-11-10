@@ -135,12 +135,18 @@ enum TorrentSearch {
         return g.flatMap { Int($0[1]) }
     }
 
-    /// The most seeded release of the season that holds the episode: that episode alone, a range with it, or a
-    /// release without numbers (the whole season).
-    static func best(_ items: [Release], episode: Int, season: Int) -> Release? {
-        var usable: [Release] = []
+    /// The releases of the season that hold the episode, the best to stream first. A release of that episode alone
+    /// with 20 seeders or more goes before the batches: its pieces are 1-2 MB and the file is small, while a Blu-ray
+    /// batch has 16 MB pieces and a bitrate above the download speed (2.32 took one and never began to play).
+    /// Then by seeders.
+    static func ranked(_ items: [Release], episode: Int, season: Int) -> [Release] {
+        var usable: [(release: Release, single: Bool)] = []
         for item in items where item.seeders > 0 {
             let name = item.name
+            // raw TV captures: MPEG-2 transport streams of several GB
+            if Rx.test(#"\.ts$|mpeg-?2"#, name) {
+                continue
+            }
             let found = seasonNumber(name)
             if let found, found != season {
                 continue
@@ -150,7 +156,7 @@ enum TorrentSearch {
             }
             if let number = episodeNumber(name) {
                 if number == episode {
-                    usable.append(item)
+                    usable.append((item, item.seeders >= 20))
                 }
                 continue
             }
@@ -158,9 +164,10 @@ enum TorrentSearch {
             if !ranges.isEmpty && !ranges.contains(where: { (Int($0[1]) ?? 0) <= episode && episode <= (Int($0[2]) ?? 0) }) {
                 continue
             }
-            usable.append(item)
+            usable.append((item, false))
         }
-        return usable.max { $0.seeders < $1.seeders }
+        return usable.sorted { ($0.single ? 1 : 0, $0.release.seeders) > ($1.single ? 1 : 0, $1.release.seeders) }
+            .map { $0.release }
     }
 
     /// One video file of the episode: extras, specials, samples, NCOP and NCED are out; two matches stop the choice.
@@ -471,10 +478,31 @@ final class OnlineWatch: ObservableObject {
         guard !releases.isEmpty else {
             throw failure ?? TorrentSearch.Failure(message: "Не найдены релизы с совпадающим названием: " + titles.joined(separator: ", "))
         }
-        guard let release = TorrentSearch.best(Array(releases.values), episode: episode, season: season) else {
+        let candidates = TorrentSearch.ranked(Array(releases.values), episode: episode, season: season)
+        guard !candidates.isEmpty else {
             throw TorrentSearch.Failure(message: "Раздачи найдены (\(releases.count)), но серии \(episode) сезона \(season) с раздающими среди них нет")
         }
-        status = "Выбрано (\(release.seeders) сидов): \(release.name)"
+        // a release without peers or too slow gives way to the next one
+        var lastError: Error = TorrentSearch.Failure(message: "Нет раздач")
+        for release in candidates.prefix(3) {
+            do {
+                try await stream(release, entry: entry, episode: episode, key: key, subs: subs)
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                CrashTrail.mark("онлайн: \(release.name): \(error.localizedDescription)")
+                lastError = error
+                teardown()
+            }
+        }
+        throw lastError
+    }
+
+    private func stream(_ release: TorrentSearch.Release, entry: JimakuService.Entry, episode: Int, key: String,
+                        subs: URL) async throws {
+        let chosen = "\(release.name) (\(release.seeders) сидов)"
+        status = "Выбрано: \(chosen)"
 
         let torrent = SatoriTorrent(savePath: Self.root.appendingPathComponent("torrent").path)
         self.torrent = torrent
@@ -482,10 +510,10 @@ final class OnlineWatch: ObservableObject {
             throw TorrentSearch.Failure(message: "Magnet-ссылка не принята")
         }
         var files: [SatoriTorrentFile]?
-        for second in 0..<120 {
+        for second in 0..<60 {
             files = torrent.files()
             if files != nil { break }
-            status = "Ищу раздающих, список файлов… \(second) с, пиров: \(torrent.peerCount())"
+            status = "\(chosen)\nИщу раздающих, список файлов… \(second) с, пиров: \(torrent.peerCount())"
             try await Task.sleep(nanoseconds: 1_000_000_000)
         }
         guard let files else {
@@ -498,17 +526,17 @@ final class OnlineWatch: ObservableObject {
         let fileName = (file.path as NSString).lastPathComponent
         let stem = (fileName as NSString).deletingPathExtension
 
-        status = "Субтитры Jimaku…"
+        status = "\(chosen)\nСубтитры Jimaku…"
         let found = await Self.fetchSubtitles(entry: entry, episode: episode, key: key, folder: subs, stem: stem, release: fileName)
 
+        // the start of the file without a gap; «скачано» also counts pieces that are not whole yet
         let need = min(file.size, 8 * 1024 * 1024)
-        for second in 0..<180 {
-            let have = torrent.availableBytes(fromOffset: 0)
-            if have >= need { break }
-            status = "Буфер: \(have / 1024 / 1024) из \(need / 1024 / 1024) МБ, \(torrent.downloadRate() / 1024) КБ/с, пиров: \(torrent.peerCount())"
+        for second in 0..<120 {
+            if torrent.availableBytes(fromOffset: 0) >= need { break }
+            status = "\(chosen)\nФайл \(file.size / 1024 / 1024) МБ, скачано \(torrent.downloadedBytes() / 1024 / 1024) МБ, \(torrent.downloadRate() / 1024) КБ/с, пиров: \(torrent.peerCount())"
             try await Task.sleep(nanoseconds: 1_000_000_000)
-            if second == 179 {
-                throw TorrentSearch.Failure(message: "Слишком медленно: нет раздающих")
+            if second == 119 {
+                throw TorrentSearch.Failure(message: "Слишком медленно: начало серии не скачалось за 2 минуты")
             }
         }
         let server = StreamServer(torrent: torrent)

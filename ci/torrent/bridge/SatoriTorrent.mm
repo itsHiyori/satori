@@ -9,6 +9,7 @@
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <algorithm>
 #include <mutex>
 #include <memory>
 
@@ -136,9 +137,12 @@
         return;
     }
     lt::peer_request first = info->map_file(file, offset, 1);
-    // the next ~24 pieces, the nearest first: a deadline in milliseconds from now
+    // the next ~24 MB (2 to 24 pieces), the nearest first: a deadline in milliseconds from now. With 16 MB pieces 24 of
+    // them were 384 MB wanted at once, and the first one took minutes.
+    int ahead = static_cast<int>((24LL * 1024 * 1024 + info->piece_length() - 1) / info->piece_length());
+    ahead = std::max(2, std::min(24, ahead));
     int deadline = 0;
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < ahead; i++) {
         lt::piece_index_t piece(static_cast<int>(first.piece) + i);
         if (static_cast<int>(piece) >= info->num_pieces()) {
             break;
@@ -210,6 +214,15 @@
             return 0;
         }
         return info->files().file_size(lt::file_index_t(_selected));
+    } catch (...) {
+        return 0;
+    }
+}
+
+- (long long)downloadedBytes {
+    std::lock_guard<std::mutex> guard(_lock);
+    try {
+        return _handle.is_valid() ? _handle.status({}).total_wanted_done : 0;
     } catch (...) {
         return 0;
     }

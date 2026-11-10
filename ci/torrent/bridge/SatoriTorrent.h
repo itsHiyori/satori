@@ -25,6 +25,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Absolute path of the selected file on disk (sparse until it is complete).
 - (nullable NSString *)selectedFilePath;
 - (long long)selectedFileSize;
+/// Bytes of the selected file downloaded so far (pieces that are not whole yet count too).
+- (long long)downloadedBytes;
 /// Download speed in bytes per second, and the number of peers.
 - (long long)downloadRate;
 - (int)peerCount;
