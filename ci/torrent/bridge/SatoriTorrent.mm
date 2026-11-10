@@ -55,7 +55,14 @@
         [[NSFileManager defaultManager] createDirectoryAtPath:savePath withIntermediateDirectories:YES attributes:nil error:nil];
         lt::settings_pack pack;
         pack.set_str(lt::settings_pack::user_agent, "Satori/2.30");
-        pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:0,[::]:0"); // IPv6 too: mobile networks
+        pack.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:0");
+        // On the phone UDP did not get through (0 DHT nodes, UDP trackers silent): every peer was first tried over
+        // uTP and the first minute was lost to timeouts. TCP only for outgoing connections, and a shorter wait.
+        pack.set_bool(lt::settings_pack::enable_outgoing_utp, false);
+        pack.set_int(lt::settings_pack::peer_connect_timeout, 7);
+        pack.set_int(lt::settings_pack::connection_speed, 60);
+        pack.set_str(lt::settings_pack::dht_bootstrap_nodes,
+                     "dht.libtorrent.org:25401,router.bittorrent.com:6881,router.utorrent.com:6881,dht.transmissionbt.com:6881");
         pack.set_bool(lt::settings_pack::enable_dht, true);
         pack.set_bool(lt::settings_pack::enable_lsd, false);
         pack.set_int(lt::settings_pack::upload_rate_limit, 64 * 1024); // streaming, not seeding
@@ -286,17 +293,16 @@
         std::string out = "пиров " + std::to_string(st.num_peers) + ", известно " + std::to_string(st.list_peers)
             + ", попыток " + std::to_string(_attempts) + ", DHT-узлов " + (_dhtNodes < 0 ? std::string("?") : std::to_string(_dhtNodes));
         for (const lt::announce_entry &tracker : _handle.trackers()) {
+            // one answer from any local address is enough; an error is shown only when nothing answered
             std::string state = "ответа пока нет";
             for (const auto &endpoint : tracker.endpoints) {
                 const auto &v1 = endpoint.info_hashes[lt::protocol_version::V1];
-                if (v1.last_error) {
-                    state = v1.last_error.message();
-                } else if (v1.start_sent && v1.fails == 0) {
+                if (!v1.last_error && v1.start_sent && v1.fails == 0) {
                     state = "ответил";
                     break;
                 }
-                if (!v1.message.empty()) {
-                    state += " (" + v1.message + ")";
+                if (v1.last_error) {
+                    state = v1.last_error.message();
                 }
             }
             std::string url = tracker.url;

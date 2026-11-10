@@ -529,7 +529,10 @@ final class OnlineWatch: ObservableObject {
         let stem = (fileName as NSString).deletingPathExtension
 
         status = "\(chosen)\nСубтитры Jimaku…"
-        let found = await Self.fetchSubtitles(entry: entry, episode: episode, key: key, folder: subs, stem: stem, release: fileName)
+        let subtitles = await Self.fetchSubtitles(entry: entry, episode: episode, key: key, folder: subs, stem: stem, release: fileName)
+        if let problem = subtitles {
+            CrashTrail.mark("онлайн: субтитры Jimaku: \(problem)")
+        }
 
         // the start of the file without a gap; «скачано» also counts pieces that are not whole yet
         let need = min(file.size, 8 * 1024 * 1024)
@@ -555,27 +558,39 @@ final class OnlineWatch: ObservableObject {
         components.host = "127.0.0.1"
         components.port = Int(server.port)
         components.path = subs.appendingPathComponent(fileName).path
-        status = found ? "Готово" : "Готово, но субтитров Jimaku для этой серии нет"
+        status = subtitles.map { "Готово, но без субтитров Jimaku: \($0)" } ?? "Готово"
         playURL = components.url
     }
 
     /// The first Jimaku file with readable lines, saved as «stem.ext» in the folder the player will look in.
+    /// nil when it is there, otherwise why not. Jimaku answers slowly from some networks (7 s and more while the
+    /// torrent takes the line), so every request gets a second try.
     private static func fetchSubtitles(entry: JimakuService.Entry, episode: Int, key: String, folder: URL,
-                                       stem: String, release: String) async -> Bool {
+                                       stem: String, release: String) async -> String? {
+        func twice<T>(_ work: () async throws -> T) async throws -> T {
+            do {
+                return try await work()
+            } catch {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                return try await work()
+            }
+        }
         do {
-            let files = try await JimakuService.files(entry: entry.id, episode: episode, key: key)
+            let files = try await twice { try await JimakuService.files(entry: entry.id, episode: episode, key: key) }
+            guard !files.isEmpty else { return "для этой серии файлов нет" }
             for file in JimakuService.pickFiles(files, release: JimakuName.release(release)) {
-                let temp = try await JimakuService.download(file, key: key)
+                let temp = try await twice { try await JimakuService.download(file, key: key) }
                 guard !EmbeddedSubtitles.cues(fromFile: temp).isEmpty else { continue }
                 let ext = (file.name as NSString).pathExtension.lowercased()
                 let dest = folder.appendingPathComponent(stem).appendingPathExtension(ext)
                 try? FileManager.default.removeItem(at: dest)
                 try FileManager.default.moveItem(at: temp, to: dest)
-                return true
+                return nil
             }
+            return "ни один из \(files.count) файлов не подошёл"
         } catch {
+            return "нет связи с jimaku.cc (\(error.localizedDescription))"
         }
-        return false
     }
 
     private func teardown() {
