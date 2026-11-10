@@ -533,6 +533,8 @@ final class OnlineWatch: ObservableObject {
         let need = min(file.size, 8 * 1024 * 1024)
         for second in 0..<120 {
             if torrent.availableBytes(fromOffset: 0) >= need { break }
+            // set again every second: a deadline that has passed is not served, and the first pieces were never asked for
+            torrent.prioritize(fromOffset: 0)
             status = "\(chosen)\nФайл \(file.size / 1024 / 1024) МБ, скачано \(torrent.downloadedBytes() / 1024 / 1024) МБ, \(torrent.downloadRate() / 1024) КБ/с, пиров: \(torrent.peerCount())"
             try await Task.sleep(nanoseconds: 1_000_000_000)
             if second == 119 {

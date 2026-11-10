@@ -20,7 +20,7 @@ cmake -S lt -B build -G Ninja \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_STANDARD=17 -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DBUILD_SHARED_LIBS=OFF -Dbuild_tests=OFF -Dbuild_examples=OFF -Dbuild_tools=OFF -Dpython-bindings=OFF \
-  -Dencryption=OFF -Dwebtorrent=OFF -Dgnutls=OFF -Ddeprecated-functions=OFF \
+  -Dencryption=ON -Dwebtorrent=OFF -Dgnutls=OFF -Ddeprecated-functions=OFF \
   -DBOOST_ROOT="$WORK/boost" -DBoost_NO_SYSTEM_PATHS=ON -DBoost_INCLUDE_DIR="$WORK/boost" \
   -DCMAKE_CXX_FLAGS="-DBOOST_ASIO_DISABLE_KQUEUE_EV_EXCEPT"
 cmake --build build --target torrent-rasterbar -j "$(sysctl -n hw.ncpu)"
@@ -28,6 +28,7 @@ cmake --build build --target torrent-rasterbar -j "$(sysctl -n hw.ncpu)"
 mkdir -p "$OUT/lib" "$OUT/include"
 cp "$(find build -name 'libtorrent-rasterbar*.a' | head -1)" "$OUT/lib/libtorrent-rasterbar.a"
 cp -R lt/include/libtorrent "$OUT/include/"
+# protocol encryption is on (-Dencryption=ON): without it most seeders refuse the connection (2 peers instead of 7 in a test)
 # only the headers libtorrent and the bridge include are kept (the full Boost tree is ~700 MB)
 mkdir -p "$OUT/boost"
 cp -R boost/boost "$OUT/boost/boost"
