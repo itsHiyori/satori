@@ -59,75 +59,108 @@ enum TorrentSearch {
         "udp://exodus.desync.com:6969/announce",
     ]
 
-    /// The names a release can carry: both names of the Jimaku entry, with and without «Season N».
+    private static let seasonTail = #"\s*(?:\d+(?:st|nd|rd|th)\s+season|season\s*\d+|s\d{1,2})\s*$"#
+
+    /// Letters and digits only: «[Oshi no Ko]», «Frieren: Beyond…» and «Frieren - Beyond…» compare as equal.
+    static func norm(_ text: String) -> String {
+        text.lowercased().replacingOccurrences(of: "[^a-z0-9]+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The names a release can carry: both names of the Jimaku entry, with and without «Season N», without brackets.
     static func searchTitles(_ entry: JimakuService.Entry) -> [String] {
         var titles: [String] = []
         for title in [entry.name, entry.english_name].compactMap({ $0 }) {
-            let bare = title.replacingOccurrences(
-                of: #"\s*(?:\d+(?:st|nd|rd|th)\s+season|season\s*\d+|s\d{1,2})\s*$"#, with: "",
-                options: [.regularExpression, .caseInsensitive]).trimmingCharacters(in: .whitespaces)
-            for candidate in [title, bare] where !candidate.isEmpty
-                && !titles.contains(where: { $0.caseInsensitiveCompare(candidate) == .orderedSame }) {
+            let plain = title.replacingOccurrences(of: #"[\[\]【】]"#, with: " ", options: .regularExpression)
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+            let bare = plain.replacingOccurrences(of: seasonTail, with: "", options: [.regularExpression, .caseInsensitive])
+                .trimmingCharacters(in: .whitespaces)
+            for candidate in [plain, bare] where !norm(candidate).isEmpty
+                && !titles.contains(where: { norm($0) == norm(candidate) }) {
                 titles.append(candidate)
             }
         }
         return titles
     }
 
-    /// The release starts with the title; what follows is a number, a season or «batch», not another title.
-    static func matches(_ release: String, titles: [String]) -> Bool {
-        let clean = release.replacingOccurrences(of: #"\[[^\]]*\]"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespaces)
+    /// What Nyaa is asked: the titles, and for a later season the bare title with «S02» (releases named that way are
+    /// not among the most seeded ones of the bare title).
+    static func queries(_ titles: [String], season: Int) -> [String] {
+        var out = titles
+        guard season > 1 else { return out }
         for title in titles {
-            guard let range = clean.range(of: title, options: [.anchored, .caseInsensitive]) else {
-                continue
+            let bare = title.replacingOccurrences(of: seasonTail, with: "", options: [.regularExpression, .caseInsensitive])
+                .trimmingCharacters(in: .whitespaces)
+            let query = bare + String(format: " S%02d", season)
+            if !out.contains(query) {
+                out.append(query)
             }
-            let rest = clean[range.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: " -_.:"))
-            if rest.isEmpty || Rx.test(#"^(?:\d|\(|season\b|s\d|batch\b|complete\b)"#, rest) {
-                return true
+        }
+        return out
+    }
+
+    /// One of the names of the release (they are split by « | » and « / », the group in front is cut) starts with the
+    /// title; what follows is a number, a season or the quality, not another title.
+    static func matches(_ release: String, titles: [String]) -> Bool {
+        let parts = release.replacingOccurrences(of: #"^\s*\[[^\]]*\]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s[|/]\s"#, with: "\n", options: .regularExpression)
+            .components(separatedBy: "\n").map(norm)
+        let wanted = titles.map(norm).filter { !$0.isEmpty }
+        for clean in parts {
+            for title in wanted {
+                if clean == title {
+                    return true
+                }
+                if clean.hasPrefix(title + " "), Rx.test(
+                    #"^(?:\d|season\b|s\d|batch\b|complete\b|bd|blu|web|tv\b|dual|multi|hevc|x26|h26|av1|remux|vostfr|uncensored)"#,
+                    String(clean.dropFirst(title.count + 1))) {
+                    return true
+                }
             }
         }
         return false
     }
 
     static func seasonNumber(_ name: String) -> Int? {
-        guard let g = Rx.first(#"(?:\bseason[ ._-]*(\d+)|\b(\d+)(?:st|nd|rd|th) season|(?<![a-z0-9])s(\d{1,2})(?![a-z0-9]))"#, name) else {
+        guard let g = Rx.first(#"(?:\bseason[ ._-]*(\d+)|\b(\d+)(?:st|nd|rd|th) season|(?<![a-z0-9])s(\d{1,2})(?:e\d+)?(?![a-z0-9]))"#, name) else {
             return nil
         }
         return g.dropFirst().compactMap { Int($0) }.first
     }
 
-    /// A batch (or a range) that holds the episode, the most seeded first; without one, a single release of that episode.
+    /// The episode of a release of one episode: « - 06» first («- 06 (S03E30)» counts from the first season), then S03E06.
+    static func episodeNumber(_ name: String) -> Int? {
+        let g = Rx.first(#"\s-\s(\d{1,3})(?:v\d)?(?=\s|\[|\(|$)"#, name) ?? Rx.first(#"s\d+e(\d+)"#, name)
+        return g.flatMap { Int($0[1]) }
+    }
+
+    /// The most seeded release of the season that holds the episode: that episode alone, a range with it, or a
+    /// release without numbers (the whole season).
     static func best(_ items: [Release], episode: Int, season: Int) -> Release? {
-        func seasonOK(_ name: String) -> Bool {
-            let s = seasonNumber(name)
-            if let s, s != season {
-                return false
-            }
-            return !(season > 1 && s == nil)
-        }
-        var batches: [Release] = []
-        var singles: [Release] = []
-        for item in items where seasonOK(item.name) {
+        var usable: [Release] = []
+        for item in items where item.seeders > 0 {
             let name = item.name
-            let single = Rx.test(#"s\d+e\d+|\s-\s\d{1,3}(?:v\d)?(?:\s|\[|$)"#, name)
-            if single {
-                let number = Rx.first(#"s\d+e(\d+)|\s-\s(\d{1,3})(?:v\d)?(?:\s|\[|$)"#, name)?.dropFirst().compactMap { Int($0) }.first
+            let found = seasonNumber(name)
+            if let found, found != season {
+                continue
+            }
+            if season > 1 && found == nil {
+                continue
+            }
+            if let number = episodeNumber(name) {
                 if number == episode {
-                    singles.append(item)
+                    usable.append(item)
                 }
                 continue
             }
             let ranges = Rx.all(#"(?<!\d)(\d{1,3})\s*[-~–]\s*(\d{1,3})(?!\d)"#, name)
-            if !ranges.isEmpty {
-                if ranges.contains(where: { (Int($0[1]) ?? 0) <= episode && episode <= (Int($0[2]) ?? 0) }) {
-                    batches.append(item)
-                }
-            } else if Rx.test(#"\b(?:batch|complete)\b|(?<![a-z0-9])s\d{1,2}(?![a-z0-9])"#, name) {
-                batches.append(item)
+            if !ranges.isEmpty && !ranges.contains(where: { (Int($0[1]) ?? 0) <= episode && episode <= (Int($0[2]) ?? 0) }) {
+                continue
             }
+            usable.append(item)
         }
-        return (batches.max { $0.seeders < $1.seeders }) ?? (singles.max { $0.seeders < $1.seeders })
+        return usable.max { $0.seeders < $1.seeders }
     }
 
     /// One video file of the episode: extras, specials, samples, NCOP and NCED are out; two matches stop the choice.
@@ -423,7 +456,8 @@ final class OnlineWatch: ObservableObject {
         let titles = TorrentSearch.searchTitles(entry)
         var releases: [String: TorrentSearch.Release] = [:]
         var failure: Error?
-        for title in titles {
+        let season = titles.compactMap { TorrentSearch.seasonNumber($0) }.first ?? 1
+        for title in TorrentSearch.queries(titles, season: season) {
             status = "Поиск раздач: \(title)…"
             do {
                 for release in try await TorrentSearch.search(title) where TorrentSearch.matches(release.name, titles: titles) {
@@ -437,9 +471,8 @@ final class OnlineWatch: ObservableObject {
         guard !releases.isEmpty else {
             throw failure ?? TorrentSearch.Failure(message: "Не найдены релизы с совпадающим названием: " + titles.joined(separator: ", "))
         }
-        let season = titles.compactMap { TorrentSearch.seasonNumber($0) }.first ?? 1
         guard let release = TorrentSearch.best(Array(releases.values), episode: episode, season: season) else {
-            throw TorrentSearch.Failure(message: "Не найден сборник или релиз для серии \(episode)")
+            throw TorrentSearch.Failure(message: "Раздачи найдены (\(releases.count)), но серии \(episode) сезона \(season) с раздающими среди них нет")
         }
         status = "Выбрано (\(release.seeders) сидов): \(release.name)"
 
@@ -575,6 +608,15 @@ struct OnlineWatchView: View {
     @State private var episode = 1
     @State private var searching = false
     @State private var searchMessage = ""
+    @State private var showAll = false
+    @State private var collapsed = false
+
+    private var shownEntries: [JimakuService.Entry] {
+        if collapsed, let picked {
+            return [picked]
+        }
+        return showAll ? entries : Array(entries.prefix(4))
+    }
 
     var body: some View {
         List {
@@ -590,9 +632,13 @@ struct OnlineWatchView: View {
             }
             if !entries.isEmpty {
                 Section("Что смотрим") {
-                    ForEach(entries, id: \.id) { entry in
+                    ForEach(shownEntries, id: \.id) { entry in
                         Button {
-                            picked = entry
+                            // a tap on the only row opens the list again
+                            withAnimation {
+                                collapsed = !(collapsed && picked?.id == entry.id)
+                                picked = entry
+                            }
                         } label: {
                             HStack {
                                 VStack(alignment: .leading) {
@@ -608,6 +654,13 @@ struct OnlineWatchView: View {
                             }
                         }
                         .foregroundStyle(.primary)
+                    }
+                    if !collapsed && !showAll && entries.count > 4 {
+                        Button("Показать ещё \(entries.count - 4)") {
+                            withAnimation {
+                                showAll = true
+                            }
+                        }
                     }
                 }
             }
@@ -656,7 +709,19 @@ struct OnlineWatchView: View {
         searchMessage = ""
         Task {
             do {
-                entries = try await JimakuService.search(title, key: key)
+                // the closest names first: the same as typed, starting with it, holding it
+                let wanted = TorrentSearch.norm(title)
+                func distance(_ entry: JimakuService.Entry) -> Int {
+                    let names = [entry.name, entry.english_name ?? ""].map(TorrentSearch.norm)
+                    if names.contains(wanted) { return 0 }
+                    if names.contains(where: { $0.hasPrefix(wanted) }) { return 1 }
+                    return names.contains(where: { $0.contains(wanted) }) ? 2 : 3
+                }
+                entries = try await JimakuService.search(title, key: key).enumerated()
+                    .sorted { (distance($0.element), $0.offset) < (distance($1.element), $1.offset) }
+                    .map { $0.element }
+                showAll = false
+                collapsed = false
                 picked = entries.first
                 searchMessage = entries.isEmpty ? "Ничего не найдено" : ""
             } catch {
@@ -706,6 +771,19 @@ enum DiagnosticChecks {
             let found = try await TorrentSearch.search("Sousou no Frieren")
             guard !found.isEmpty else { throw Failure(message: "ответ пустой") }
             return "найдено \(found.count), лучший: \(found.map { $0.seeders }.max() ?? 0) сидов"
+        }),
+        ("Подбор раздач (правила)", {
+            let cases: [(String, Bool)] = [
+                ("скобки в названии", TorrentSearch.matches("[DB] [Oshi no Ko] 3rd Season | [Oshi No Ko] Season 3 [Dual Audio]", titles: ["Oshi no Ko 3rd Season"])),
+                ("сборник", TorrentSearch.matches("[Group] Monster (2004) [01-74] [1080p]", titles: ["Monster"])),
+                ("чужое название", !TorrentSearch.matches("[Group] Monster Musume - 21", titles: ["Monster"])),
+                ("знаки в названии", TorrentSearch.matches("[X] Frieren - Beyond Journey's End S2 - 03", titles: ["Frieren: Beyond Journey's End"])),
+                ("сезон в S03E11", TorrentSearch.seasonNumber("Oshi no Ko - S03E11") == 3),
+                ("серия", TorrentSearch.episodeNumber("[WF] Oshi no Ko 3rd Season - 06 [BD] (S03E30)") == 6),
+            ]
+            let failed = cases.filter { !$0.1 }.map { $0.0 }
+            guard failed.isEmpty else { throw Failure(message: "не прошли: " + failed.joined(separator: ", ")) }
+            return "все \(cases.count)"
         }),
         ("Торрент-движок и локальный сервер", {
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent("satori-check")
